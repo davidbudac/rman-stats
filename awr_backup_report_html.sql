@@ -2,12 +2,13 @@
 -- awr_backup_report_html.sql
 --
 -- One self-contained, offline HTML report on RMAN / backup activity, built
--- from AWR (DBA_HIST_*) plus one clearly labelled non-AWR cross-check.  This is
+-- from AWR (DBA_HIST_*) plus one clearly labelled non-AWR cross-check (controlfile,
+-- or RMAN recovery catalog with the catalog argument).  This is
 -- the visual companion of awr_backup_overview.sql (same logic, same caveats).
 --
 -- Usage (SQL*Plus, connected as SYSDBA or a user that can read DBA_HIST_*):
 --
---   @awr_backup_report_html.sql [days] [gap_minutes] [dbid] [inst] [scope]
+--   @awr_backup_report_html.sql [days] [gap_minutes] [dbid] [inst] [scope] [catalog]
 --
 --   days         look-back window in days                       default 60
 --   gap_minutes  idle gap (minutes) that splits two runs of the
@@ -17,11 +18,27 @@
 --   scope        RMAN = only RMAN sessions (normal use)         default RMAN
 --                ALL  = NO RMAN filter, group any MODULE; only for validating
 --                       the report on a DB that has no backups
+--   catalog      optional RMAN recovery catalog connect string for the
+--                cross-check panel, e.g. rco/secret@catdb or /@catwallet (wallet /
+--                external auth).  Empty = read V$RMAN_BACKUP_JOB_DETAILS from the
+--                controlfile.  Given = the script CONNECTs to the catalog as the
+--                last DB work (all AWR data is read from the target first) and
+--                reads RC_RMAN_BACKUP_JOB_DETAILS for this DBID instead.
+--                The connect string must not contain a single quote.  Passing a
+--                password on the command line is visible in ps; prefer a wallet
+--                or let awr_backup_report.sh feed it through stdin.  The password
+--                is never written to the report: only user@tns (or "wallet").
+--                If the login fails the script stops (exit status 1) and the
+--                report file is incomplete; if the DBID is not registered, or
+--                the RC_ views cannot be read, the panel says so and stays empty.
+--                Needs awr_backup_catalog_connect.sql and
+--                awr_backup_catalog_skip.sql in the same directory.
 --
 --   Examples:  @awr_backup_report_html.sql
 --              @awr_backup_report_html.sql 14 60
 --              @awr_backup_report_html.sql 60 30 "" 2
 --              @awr_backup_report_html.sql "" "" "" "" ALL
+--              @awr_backup_report_html.sql 60 30 "" "" "" /@catwallet
 --   Pass "" (or omit) to take the default; omitted trailing args are fine.
 --
 -- Output
@@ -32,8 +49,11 @@
 --
 -- How backup types and runs are found (same as the text version)
 --   AWR has no backup-type table.  The type is the MODULE of the sessions in
---   DBA_HIST_ACTIVE_SESS_HISTORY (ASH) with the ': channel' suffix removed; the
---   RMAN client session is its own type 'RMAN client/catalog'.  Within a type a
+--   DBA_HIST_ACTIVE_SESS_HISTORY (ASH) with a ': channel' suffix removed, if
+--   there is one.  Oracle 19c has no suffix (observed: MODULE 'backup archivelog',
+--   PROGRAM 'rman@host (TNS V1-V3)'), so the channel count then comes from the
+--   number of distinct sessions.  Other RMAN sessions (MODULE 'RMAN$CATALOG' or
+--   'rman@host ...') are the type 'RMAN client/catalog'.  Within a type a
 --   new run starts when the gap since the previous ASH sample is greater than
 --   gap_minutes.
 --
@@ -50,11 +70,15 @@
 --   * AWR retention may be shorter than the requested window; the report header
 --     says so (PARTIAL) when it is.
 --   * The cross-check panel reads V$RMAN_BACKUP_JOB_DETAILS (controlfile, limited
---     by control_file_record_keep_time).  It is NOT AWR.
+--     by control_file_record_keep_time) or, with the catalog argument,
+--     RC_RMAN_BACKUP_JOB_DETAILS (recovery catalog, normally a much longer
+--     history).  It is NOT AWR.  The window start is taken from the target DB
+--     clock before the catalog connect.
 --   * In a CDB, run from CDB$ROOT to see all containers.
 --   * The report embeds at most 5000 cross-check jobs.
 --
--- Read-only: SELECT statements only.  The ASH query chain is repeated for each
+-- Read-only: SELECT statements only (plus one anonymous block that only reads the
+-- RC_ views, and the CONNECT to the catalog).  The ASH query chain is repeated for each
 -- result set on purpose (SQL*Plus cannot share a CTE between statements and this
 -- script must not create temp tables).  Keep the chains in sync when editing.
 -- ============================================================================
@@ -78,7 +102,8 @@ column 2 new_value 2 noprint
 column 3 new_value 3 noprint
 column 4 new_value 4 noprint
 column 5 new_value 5 noprint
-select null "1", null "2", null "3", null "4", null "5" from dual where 1 = 0;
+column 6 new_value 6 noprint
+select null "1", null "2", null "3", null "4", null "5", null "6" from dual where 1 = 0;
 
 column p_days  new_value days        noprint
 column p_gap   new_value gap_minutes noprint
@@ -86,13 +111,42 @@ column p_dbid  new_value dbid        noprint
 column p_inst  new_value inst        noprint
 column p_scope new_value scope       noprint
 column p_file  new_value fname       noprint
+column p_win   new_value jobs_win    noprint
+column p_csrc  new_value cat_src     noprint
+column p_clab  new_value cat_label   noprint
+column p_cscr  new_value cat_script  noprint
+column p_keep  new_value cat_keep    noprint
+column p_sess new_value cat_sess0   noprint
+-- Cross-check source: CONTROLFILE or CATALOG.  The password in &6 is only used in
+-- this statement (to derive the label user@tns or "wallet") and by the CONNECT.
 select to_number(nvl('&1', '60'))                    p_days,
        to_number(nvl('&2', '30'))                    p_gap,
        to_number(nvl('&3', to_char(d.dbid)))         p_dbid,
        to_number(nvl('&4', '0'))                     p_inst,
        upper(nvl('&5', 'RMAN'))                      p_scope,
-       'awr_backup_report_' || d.name || '_' || to_char(sysdate, 'yyyymmdd_hh24mi') || '.html' p_file
-  from v$database d;
+       'awr_backup_report_' || d.name || '_' || to_char(sysdate, 'yyyymmdd_hh24mi') || '.html' p_file,
+       to_char(sysdate - to_number(nvl('&1', '60')), 'YYYY-MM-DD HH24:MI:SS') p_win,
+       case when c.s is null then 'CONTROLFILE' else 'CATALOG' end            p_csrc,
+       c.lab                                                                  p_clab,
+       case when c.s is null then 'awr_backup_catalog_skip.sql'
+            else 'awr_backup_catalog_connect.sql' end                         p_cscr,
+       (select max(value) from v$parameter where name = 'control_file_record_keep_time') p_keep,
+       to_char(sys_context('userenv', 'sessionid'))                           p_sess
+  from v$database d
+  cross join (select s,
+                     case when s is null then ''
+                          when nvl(instr(s, '/'), 0) = 1 or instr(s, '@') = 1
+                            then 'wallet (' || case when instr(s, '@', -1) > 0 then substr(s, instr(s, '@', -1) + 1) else 'local' end || ')'
+                          else substr(s, 1, least(nvl(nullif(instr(s, '/'), 0), 4000), nvl(nullif(instr(s, '@'), 0), 4000)) - 1)
+                               || '@' || case when instr(s, '@', -1) > 0 then substr(s, instr(s, '@', -1) + 1) else 'local' end
+                     end lab
+                from (select cast(q'~&6~' as varchar2(4000)) s from dual)) c;
+column p_win   clear
+column p_csrc  clear
+column p_clab  clear
+column p_cscr  clear
+column p_keep  clear
+column p_sess clear
 column p_days  clear
 column p_gap   clear
 column p_dbid  clear
@@ -104,6 +158,7 @@ column 2 clear
 column 3 clear
 column 4 clear
 column 5 clear
+column 6 clear
 
 set termout on
 prompt Generating &fname  (days=&days gap_minutes=&gap_minutes dbid=&dbid inst=&inst scope=&scope) ...
@@ -303,8 +358,8 @@ prompt <div class="card s5"><div class="ch"><div><h3>RMAN wait events per day</h
 prompt <div class="sec"><h2>Detail</h2><p>Click a column header to sort.</p></div>
 prompt <div class="card"><div class="ch"><div><h3>Summary per backup type</h3><p>Estimates from ASH. MB/s is volume-weighted (total MB over total elapsed seconds).</p></div></div><div id="tbl-sum"></div></div>
 prompt <div class="card"><div class="ch"><div><h3>Run detail</h3><p>Filter by type, sort by any column.</p></div></div><div class="chips" id="chips"></div><div id="tbl-runs"></div></div>
-prompt <div class="sec"><h2>Cross-check from the controlfile</h2><p>Not AWR. Use it as ground truth for the ASH-derived numbers above.</p></div>
-prompt <div class="card notawr"><div class="ch"><div><h3>V$RMAN_BACKUP_JOB_DETAILS<span class="badge">NOT AWR</span></h3><p id="x-sub"></p></div></div><div id="x-stats"></div><div id="x-gantt"></div><div id="x-tbl"></div></div>
+prompt <div class="sec"><h2 id="x-h2">Cross-check from the controlfile</h2><p>Not AWR. Use it as ground truth for the ASH-derived numbers above.</p></div>
+prompt <div class="card notawr"><div class="ch"><div><h3><span id="x-h3">V$RMAN_BACKUP_JOB_DETAILS</span><span class="badge">NOT AWR</span></h3><p id="x-sub"></p></div></div><div id="x-note"></div><div id="x-stats"></div><div id="x-gantt"></div><div id="x-tbl"></div></div>
 prompt </main>
 prompt <footer class="foot" id="foot"></footer>
 prompt </div>
@@ -330,9 +385,8 @@ select replace(json_object(
          'oldest'  value round((cast(x.oldest as date) - date '1970-01-01') * 86400),
          'newest'  value round((cast(x.newest as date) - date '1970-01-01') * 86400),
          'ret'     value (select max(extract(day from w.retention)) from dba_hist_wr_control w where w.dbid = &dbid),
-         'snapint' value (select max(extract(day from w.snap_interval) * 1440 + extract(hour from w.snap_interval) * 60 + extract(minute from w.snap_interval)) from dba_hist_wr_control w where w.dbid = &dbid),
-         'keep'    value (select max(value) from v$parameter where name = 'control_file_record_keep_time')
-       ), '<', '<')
+         'snapint' value (select max(extract(day from w.snap_interval) * 1440 + extract(hour from w.snap_interval) * 60 + extract(minute from w.snap_interval)) from dba_hist_wr_control w where w.dbid = &dbid)
+       ), '<', '\u003c')
   from v$database d
   cross join v$instance i
   cross join (select count(*)                   snaps,
@@ -404,7 +458,11 @@ runs as (
          min(sample_dt)                                               run_start,
          max(sample_dt)                                               run_end,
          round((max(sample_dt) - min(sample_dt)) * 86400) + 10        elapsed_sec,
-         count(distinct case when channel <> '-' then channel end)    chans,
+         case when backup_type = 'RMAN client/catalog'                 then 0
+              when count(distinct case when channel <> '-' then channel end) > 0
+                                                                       then count(distinct case when channel <> '-' then channel end)
+              else count(distinct instance_number || '.' || session_id || '.' || session_serial#)
+         end                                                          chans,
          count(distinct instance_number || '.' || session_id || '.' || session_serial#) sess,
          listagg(distinct to_char(instance_number), ',')
            within group (order by to_char(instance_number))           insts,
@@ -437,7 +495,7 @@ select replace(json_object(
          'wr'  value round(wr_bytes / power(1024, 3), 4),
          'ev'  value top_ev,
          'evp' value round(top_ev_pct, 1)
-       ), '<', '<') || ','
+       ), '<', '\u003c') || ','
   from runs
  order by run_start, backup_type
 /
@@ -483,7 +541,7 @@ ranked as (
     from agg
 )
 select replace(json_object('t' value backup_type, 'c' value cat, 'e' value ev,
-                           'n' value cnt, 'tot' value tot), '<', '<') || ','
+                           'n' value cnt, 'tot' value tot), '<', '\u003c') || ','
   from ranked
  where rn <= 12
  order by backup_type, rn
@@ -638,7 +696,7 @@ select replace(json_object(
          'd' value round((trunc(begin_interval_time) - date '1970-01-01') * 86400),
          'e' value event_name,
          'w' value sum(total_waits - p_waits),
-         's' value round(sum(time_waited_micro - p_micro) / 1e6, 3)), '<', '<') || ','
+         's' value round(sum(time_waited_micro - p_micro) / 1e6, 3)), '<', '\u003c') || ','
   from cur
  where p_startup = startup_time
    and total_waits >= p_waits and time_waited_micro >= p_micro
@@ -648,28 +706,10 @@ having sum(total_waits - p_waits) > 0
  order by trunc(begin_interval_time), event_name
 /
 prompt ];
-prompt const JOBS=[
-select replace(json_object(
-         'ty'  value input_type,
-         'st'  value status,
-         's'   value round((start_time - date '1970-01-01') * 86400),
-         'e'   value round((end_time   - date '1970-01-01') * 86400),
-         'el'  value elapsed_seconds,
-         'in'  value round(input_bytes  / power(1024, 3), 4),
-         'out' value round(output_bytes / power(1024, 3), 4),
-         'mbs' value round(input_bytes_per_sec / 1048576, 2),
-         'dev' value output_device_type), '<', '<') || ','
-  from (select * from v$rman_backup_job_details
-         where start_time >= sysdate - &days
-         order by start_time desc)
- where rownum <= 5000
- order by start_time
-/
-prompt ];
 prompt </script>
 set define off
 prompt <script>
-prompt (function(){
+prompt function awrMain(){
 prompt var D=document,DAY=86400,TOP=7,NS='http://www.w3.org/2000/svg';
 prompt function $(s,r){return (r||D).querySelector(s)}
 prompt function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
@@ -1051,25 +1091,34 @@ prompt  el.innerHTML='<button type="button" class="chip'+(any?'':' on')+'" data-
 prompt D.addEventListener('click',function(e){var b=e.target.closest&&e.target.closest('[data-chip]');if(!b)return;var k=b.getAttribute('data-chip');
 prompt  if(k==='')FILT={};else FILT[k]=!FILT[k];drawChips();paint('tbl-runs')});
 prompt
-prompt // controlfile cross-check
-prompt var jobs=JOBS;
+prompt // cross-check: controlfile or recovery catalog
+prompt var jobs=JOBS,JM=JOBMETA,isCat=JM.src==='CATALOG',srcName=isCat?'recovery catalog':'controlfile';
 prompt function jcol(st){st=String(st||'').toUpperCase();return st==='COMPLETED'?'var(--good)':st.indexOf('WARN')>=0?'var(--warn)':st.indexOf('FAIL')>=0?'var(--crit)':st.indexOf('RUNNING')>=0?'var(--c1)':'var(--other)'}
 prompt function jglyph(st){st=String(st||'').toUpperCase();return st==='COMPLETED'?'\u2713':st.indexOf('WARN')>=0?'!':st.indexOf('FAIL')>=0?'\u2715':'\u2022'}
 prompt function buildCross(){
-prompt  var keep=M.keep==null?'unknown':M.keep+' days';
-prompt  $('#x-sub').textContent='Source is the controlfile, not AWR. control_file_record_keep_time = '+keep+(M.keep!=null&&+M.keep<M.days?', which is shorter than the '+M.days+'-day window, so older jobs may already be aged out.':'.');
-prompt  if(!jobs.length){$('#x-stats').innerHTML='';$('#x-gantt').innerHTML='';$('#x-tbl').innerHTML='';empty($('#x-gantt'),'V$RMAN_BACKUP_JOB_DETAILS has no jobs in this window (record keep time '+keep+').');return}
+prompt  var keep=JM.keep==null?'unknown':JM.keep+' days',sub,note='';
+prompt  $('#x-h2').textContent=isCat?'Cross-check from the RMAN recovery catalog':'Cross-check from the controlfile';
+prompt  $('#x-h3').textContent=isCat?'RC_RMAN_BACKUP_JOB_DETAILS':'V$RMAN_BACKUP_JOB_DETAILS';
+prompt  if(isCat){
+prompt   sub='Source: RMAN recovery catalog '+(JM.label||'')+', not AWR.';
+prompt   if(JM.state==='OK')sub+=' The catalog holds '+num(JM.cnt)+' job'+(JM.cnt===1?'':'s')+' for this database (DBID '+M.dbid+'), oldest '+(JM.first==null?'n/a':dt(JM.first))+', newest '+(JM.last==null?'n/a':dt(JM.last))+'. The panel below shows the last '+M.days+' days.';
+prompt   else if(JM.state==='NOT_REGISTERED')note=banner('warn','DBID '+M.dbid+' is not registered in this recovery catalog','Nothing to show: '+(JM.label||'the catalog')+' has no database with this DBID in RC_DATABASE. Register the database (RMAN: REGISTER DATABASE) or check the dbid parameter.');
+prompt   else if(JM.state==='NO_CONNECT')note=banner('warn','The connect to the recovery catalog did not take effect','The catalog connect string was not accepted by SQL*Plus (invalid syntax?), so no catalog data was read.');
+prompt   else note=banner('warn','The recovery catalog views cannot be read','RC_DATABASE or RC_RMAN_BACKUP_JOB_DETAILS is not accessible as '+(JM.label||'this user')+' (the catalog owner or a virtual private catalog user is needed). '+(JM.err||''));
+prompt  }else sub='Source is the controlfile, not AWR. control_file_record_keep_time = '+keep+(JM.keep!=null&&+JM.keep<M.days?', which is shorter than the '+M.days+'-day window, so older jobs may already be aged out.':'.');
+prompt  $('#x-sub').textContent=sub;$('#x-note').innerHTML=note;
+prompt  if(!jobs.length){$('#x-stats').innerHTML='';$('#x-gantt').innerHTML='';$('#x-tbl').innerHTML='';if(JM.state==='OK'||!isCat)empty($('#x-gantt'),isCat?'The recovery catalog has no jobs for this database in this window.':'V$RMAN_BACKUP_JOB_DETAILS has no jobs in this window (record keep time '+keep+').');return}
 prompt  var ok=jobs.filter(function(j){return j.st==='COMPLETED'}).length,bad=jobs.filter(function(j){return String(j.st).indexOf('FAIL')>=0}).length,jh=sum(jobs,function(j){return j.el})/3600;
 prompt  var st=[[num(jobs.length),'jobs'],[num(ok),'completed'],[num(jobs.length-ok-bad),'warnings or other'],[num(bad),'failed'],[num(jh,1)+' h','job elapsed time'],[gbf(sum(jobs,function(j){return j.in}))+' GB','input read'],[gbf(sum(jobs,function(j){return j.out}))+' GB','output written']];
 prompt  if(hasRuns)st.push([num(sum(runs,function(r){return r.el})/3600,1)+' h','ASH-derived time (est.)']);
 prompt  $('#x-stats').innerHTML='<div class="stats">'+st.map(function(x){return '<div><b>'+esc(x[0])+'</b><span>'+esc(x[1])+'</span></div>'}).join('')+'</div>'}
 prompt chart('x-gantt',function(el){
-prompt  if(!jobs.length)return empty(el,'No controlfile jobs in this window.');
+prompt  if(!jobs.length){if(isCat&&JM.state!=='OK'){el.innerHTML='';return}return empty(el,'No '+srcName+' jobs in this window.')}
 prompt  var ty={};jobs.forEach(function(j){ty[j.ty]=(ty[j.ty]||0)+j.el});
 prompt  var lanes=Object.keys(ty).sort(function(a,b){return ty[b]-ty[a]}).map(function(k){return {k:k,label:k,col:'var(--ink2)'}}),sts={};jobs.forEach(function(j){sts[j.st]=1});
 prompt  var lgd='<div class="lg">'+Object.keys(sts).map(function(k){return '<span class="lgs"><i class="dot" style="background:'+jcol(k)+'"></i>'+esc(k)+' '+jglyph(k)+'</span>'}).join('')+'</div>';
 prompt  var x0=Math.min.apply(null,jobs.map(function(j){return j.s}))-3600;
-prompt  gantt(el,{lanes:lanes,items:jobs,x0:Math.max(M.win0,x0),x1:M.now,hatchTo:0,legend:lgd,label:'Controlfile job timeline',sOf:function(j){return j.s},eOf:function(j){return j.e},laneOf:function(j){return j.ty},colOf:function(j){return jcol(j.st)},
+prompt  gantt(el,{lanes:lanes,items:jobs,x0:Math.max(M.win0,x0),x1:M.now,hatchTo:0,legend:lgd,label:(isCat?'Recovery catalog':'Controlfile')+' job timeline',sOf:function(j){return j.s},eOf:function(j){return j.e},laneOf:function(j){return j.ty},colOf:function(j){return jcol(j.st)},
 prompt   tipOf:function(j){return tt(j.ty,[[jcol(j.st),'Status',j.st+' '+jglyph(j.st)],[null,'Start',dt(j.s)],[null,'End',dt(j.e)],[null,'Elapsed',dur(j.el)],[null,'Input / output',gbf(j.in)+' / '+gbf(j.out)+' GB'],[null,'Input rate',num(j.mbs,1)+' MB/s'],[null,'Device',j.dev||'']])}})});
 prompt tbl('x-tbl',{defk:2,defdir:-1,limit:100,empty:'',rows:function(){return jobs},cols:[
 prompt  {l:'Input type',h:function(j){return esc(j.ty)},v:function(j){return j.ty}},
@@ -1091,7 +1140,7 @@ prompt  +'<li>Authoritative IO is the snapshot delta of <code>DBA_HIST_IOSTAT_FU
 prompt  +'<div><h3>Read this before trusting the numbers</h3><ul><li>AWR keeps 1 in 10 ASH samples. Hours, GB and MB/s from ASH are sampled estimates; very short backups can be missed.</li>'
 prompt  +'<li>Run IO is <code>delta_bytes / delta_time x 10 s</code> per retained sample, so it is rough.</li>'
 prompt  +'<li>Function RMAN also counts non-backup IO (controlfile autobackups, Data Guard, flashback, recovery). Treat it as an upper bound.</li>'
-prompt  +'<li>AWR coverage may be partial: retention is '+(M.ret==null?'unknown':M.ret+' days')+'. The controlfile panel is not AWR and is limited by control_file_record_keep_time.</li>'
+prompt  +'<li>AWR coverage may be partial: retention is '+(M.ret==null?'unknown':M.ret+' days')+'. '+(isCat?'The recovery catalog panel is not AWR; the catalog usually keeps more history than the controlfile.':'The controlfile panel is not AWR and is limited by control_file_record_keep_time.')+'</li>'
 prompt  +'<li>Needs the Diagnostics Pack license. In a CDB, run from CDB$ROOT to see all containers.</li></ul></div>'
 prompt  +'<div><h3>About this file</h3><p>Generated by awr_backup_report_html.sql from '+esc(M.db)+' ('+esc(M.host)+') on '+dt(M.now)+', database clock. Self-contained: no network access, fonts or scripts are loaded from elsewhere. Colours follow the backup type: the '+TOP+' types with most elapsed time get a colour, the rest are grouped as Other.</p></div>'}
 prompt
@@ -1104,7 +1153,116 @@ prompt
 prompt // go
 prompt buildTop();buildKpis();buildCross();buildFoot();drawSegs();drawChips();paintAll();
 prompt var rt;window.addEventListener('resize',function(){clearTimeout(rt);rt=setTimeout(function(){Object.keys(CH).forEach(function(id){var el=$('#'+id);if(el&&el.clientWidth!==el.__w)paint(id)})},120)});
-prompt })();
+prompt }
+prompt </script>
+set define '&'
+-- ----------------------------------------------------------------------------
+-- The cross-check data is the LAST DB work.  With a catalog argument the script
+-- CONNECTs to the RMAN recovery catalog here, so nothing that needs the target
+-- DB may follow.  The spool is closed around the CONNECT so that nothing it prints
+-- ("Connected.", glogin.sql output) can reach the report file.
+spool off
+define cat_termout = ON
+@@&cat_script
+-- A CONNECT re-runs glogin.sql, which may change SET options: set them again.
+set define '&' verify off echo off termout off feedback off heading on
+set trimspool on trimout on tab off
+set lines 250 pages 200 long 4000 numwidth 12
+set serveroutput off
+ttitle off
+btitle off
+repheader off
+repfooter off
+-- State of the source: CONTROLFILE / OK / NOT_REGISTERED / NO_ACCESS: <error>.
+-- Dynamic SQL, so this script never parses a view that does not exist where it runs.
+variable b_state varchar2(300)
+variable b_cnt   number
+variable b_first number
+variable b_last  number
+declare
+  l_reg number;
+begin
+  :b_state := 'OK';
+  :b_cnt   := 0;
+  if '&cat_src' <> 'CATALOG' then
+    :b_state := 'CONTROLFILE';
+    return;
+  end if;
+  if to_char(sys_context('userenv', 'sessionid')) = '&cat_sess0' then
+    :b_state := 'NO_CONNECT';
+    return;
+  end if;
+  begin
+    execute immediate 'select count(*) from rc_database where dbid = :1' into l_reg using &dbid;
+    if l_reg = 0 then
+      :b_state := 'NOT_REGISTERED';
+      return;
+    end if;
+    execute immediate 'select count(*), round((min(start_time) - date ''1970-01-01'') * 86400), '
+      || 'round((max(start_time) - date ''1970-01-01'') * 86400) from rc_rman_backup_job_details '
+      || 'where db_key in (select db_key from rc_database where dbid = :1)'
+      into :b_cnt, :b_first, :b_last using &dbid;
+  exception when others then
+    :b_state := 'NO_ACCESS: ' || replace(replace(replace(substr(sqlerrm, 1, 200), chr(39), ' '), chr(38), ' '), chr(34), ' ');
+  end;
+end;
+/
+column c_state  new_value cat_state  noprint
+column c_cnt    new_value cat_cnt    noprint
+column c_first  new_value cat_first  noprint
+column c_last   new_value cat_last   noprint
+column c_src    new_value jobs_src   noprint
+select :b_state c_state, nvl(:b_cnt, 0) c_cnt, nvl(to_char(:b_first), 'null') c_first, nvl(to_char(:b_last), 'null') c_last,
+       case when :b_state = 'CONTROLFILE'
+              then 'v$rman_backup_job_details'
+            when :b_state = 'OK'
+              then '(select * from rc_rman_backup_job_details where db_key in (select db_key from rc_database where dbid = &dbid))'
+            else '(select to_char(null) input_type, to_char(null) status, sysdate start_time, sysdate end_time, 0 elapsed_seconds, '
+                 || '0 input_bytes, 0 output_bytes, 0 input_bytes_per_sec, to_char(null) output_device_type from dual where 1 = 0)'
+       end c_src
+  from dual
+/
+column c_state  clear
+column c_cnt    clear
+column c_first  clear
+column c_last   clear
+column c_src    clear
+spool &fname append
+set pages 0 heading off feedback off trimspool on lines 32767 termout off verify off newpage none
+set define '&' sqlterminator off
+prompt <script>
+prompt const JOBS=[
+select replace(json_object(
+         'ty'  value input_type,
+         'st'  value status,
+         's'   value round((start_time - date '1970-01-01') * 86400),
+         'e'   value round((end_time   - date '1970-01-01') * 86400),
+         'el'  value elapsed_seconds,
+         'in'  value round(input_bytes  / power(1024, 3), 4),
+         'out' value round(output_bytes / power(1024, 3), 4),
+         'mbs' value round(input_bytes_per_sec / 1048576, 2),
+         'dev' value output_device_type), '<', '\u003c') || ','
+  from (select * from &jobs_src
+         where start_time >= to_date('&jobs_win', 'YYYY-MM-DD HH24:MI:SS')
+         order by start_time desc)
+ where rownum <= 5000
+ order by start_time
+/
+prompt ];
+prompt const JOBMETA=
+select replace(json_object(
+         'src'   value '&cat_src',
+         'label' value '&cat_label',
+         'state' value case when '&cat_state' like 'NO^_ACCESS%' escape '^' then 'NO_ACCESS' else '&cat_state' end,
+         'err'   value case when '&cat_state' like 'NO^_ACCESS: %' escape '^' then substr('&cat_state', 12) end,
+         'cnt'   value &cat_cnt,
+         'first' value &cat_first,
+         'last'  value &cat_last,
+         'keep'  value nullif('&cat_keep', '')), '<', '\u003c')
+  from dual
+/
+prompt ;
+prompt awrMain();
 prompt </script>
 prompt </body>
 prompt </html>

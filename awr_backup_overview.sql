@@ -3,11 +3,11 @@
 --
 -- How long, and how much work, did each type of RMAN backup do over the last
 -- N days?  Built from AWR (DBA_HIST_*) only, apart from the clearly labelled
--- optional cross-check in section F.
+-- optional cross-check in section F (controlfile, or RMAN recovery catalog).
 --
 -- Usage (SQL*Plus, connected as SYSDBA or a user that can read DBA_HIST_*):
 --
---   @awr_backup_overview.sql [days] [gap_minutes] [dbid] [inst] [scope]
+--   @awr_backup_overview.sql [days] [gap_minutes] [dbid] [inst] [scope] [catalog]
 --
 --   days         look-back window in days                       default 60
 --   gap_minutes  idle gap (minutes) that splits two runs of the
@@ -17,10 +17,25 @@
 --   scope        RMAN = only RMAN sessions (normal use)         default RMAN
 --                ALL  = NO RMAN filter, group any MODULE; only for validating
 --                       the run detection / IO maths on a DB with no backups
+--   catalog      optional RMAN recovery catalog connect string for section F,
+--                e.g. rco/secret@catdb or /@catwallet (wallet / external auth).
+--                Empty = read V$RMAN_BACKUP_JOB_DETAILS from the controlfile.
+--                Given = the script CONNECTs to the catalog as the last DB work
+--                (after sections 0 to D, which always read the target DB) and
+--                reads RC_RMAN_BACKUP_JOB_DETAILS for this DBID instead.
+--                The connect string must not contain a single quote.  Passing a
+--                password on the command line is visible in ps; prefer a wallet
+--                or let awr_backup_report.sh feed it through stdin.  The password
+--                is never printed: only user@tns (or "wallet") is shown.
+--                If the login fails the script stops (exit status 1); if the DBID
+--                is not registered, or the RC_ views cannot be read, section F
+--                says so and stays empty.  Needs awr_backup_catalog_connect.sql
+--                and awr_backup_catalog_skip.sql in the same directory.
 --
 --   Examples:  @awr_backup_overview.sql
 --              @awr_backup_overview.sql 14 60
 --              @awr_backup_overview.sql 60 30 "" 2
+--              @awr_backup_overview.sql 60 30 "" "" "" /@catwallet
 --   Pass "" (or omit) to take the default; omitted trailing args are fine.
 --
 -- Sections
@@ -30,17 +45,21 @@
 --   C  Authoritative RMAN IO per day (DBA_HIST_IOSTAT_FUNCTION) next to the
 --      ASH-based estimate, so the estimate can be sanity-checked
 --   D  RMAN related wait events per day (DBA_HIST_SYSTEM_EVENT)
---   F  NOT AWR: cross-check against V$RMAN_BACKUP_JOB_DETAILS
+--   F  NOT AWR: cross-check against V$RMAN_BACKUP_JOB_DETAILS (controlfile) or,
+--      with the catalog argument, RC_RMAN_BACKUP_JOB_DETAILS (recovery catalog)
 --
 -- How backup types are found
 --   AWR has no backup-type table.  The type comes from DBA_HIST_ACTIVE_SESS_HISTORY
 --   (ASH): RMAN channel sessions set MODULE to strings such as
---   'backup full datafile: ORA_DISK_1', 'backup incr datafile: ORA_SBT_TAPE_1',
---   'backup archivelog: ORA_DISK_1', 'backup controlfile', 'backup spfile',
---   'restore ...', 'validate ...'.  backup_type is MODULE with the ': channel'
---   suffix removed, channel is that suffix.  The RMAN client session itself
---   (MODULE 'rman@host ...', PROGRAM 'rman@host (TNS V1-V3)') is reported as
---   the type 'RMAN client/catalog'.
+--   'backup full datafile', 'backup archivelog', 'backup controlfile',
+--   'backup spfile', 'restore ...', 'validate ...'.  Older releases append the
+--   channel (': ORA_DISK_1'); Oracle 19c does not (observed: MODULE 'backup
+--   archivelog', PROGRAM 'rman@host (TNS V1-V3)', ACTION '0000699 STARTED16').
+--   backup_type is MODULE with a ': channel' suffix removed, if there is one.
+--   Without a suffix the CHANNELS column counts distinct sessions instead (one
+--   RMAN channel = one server session).  Other RMAN sessions (MODULE
+--   'RMAN$CATALOG' or 'rman@host ...', PROGRAM 'rman@host (TNS V1-V3)') are
+--   reported as the type 'RMAN client/catalog'.
 --
 -- How runs are found
 --   Within one backup type, a new run starts when the gap since the previous
@@ -62,15 +81,18 @@
 --     average over the whole run, not a peak, and elapsed = end - start + 10 s.
 --   * AWR retention may be shorter than the requested window (default 8 days
 --     out of the box).  Section 0 prints the oldest snapshot that exists.
---   * Section F reads the controlfile (subject to control_file_record_keep_time),
---     not AWR.
+--   * Section F is not AWR.  It reads the controlfile (subject to
+--     control_file_record_keep_time) or, with the catalog argument, the RMAN
+--     recovery catalog, which normally keeps a much longer history.  Job times
+--     are compared with the target DB clock taken before the catalog connect.
 --   * In a CDB, run from CDB$ROOT to see all containers.
 --
 -- The statements for A and B repeat the same WITH chain on purpose: SQL*Plus
 -- cannot share a CTE between statements and this script must stay read-only
 -- (no temp tables).  Keep the chains in sync when editing.
 --
--- Read-only: SELECT statements only.
+-- Read-only: SELECT statements only (plus one anonymous block that only reads
+-- the RC_ views, and the CONNECT to the catalog).
 -- ============================================================================
 
 whenever sqlerror continue
@@ -92,19 +114,58 @@ column 2 new_value 2 noprint
 column 3 new_value 3 noprint
 column 4 new_value 4 noprint
 column 5 new_value 5 noprint
-select null "1", null "2", null "3", null "4", null "5" from dual where 1 = 0;
+column 6 new_value 6 noprint
+select null "1", null "2", null "3", null "4", null "5", null "6" from dual where 1 = 0;
 
 column p_days  new_value days        noprint
 column p_gap   new_value gap_minutes noprint
 column p_dbid  new_value dbid        noprint
 column p_inst  new_value inst        noprint
 column p_scope new_value scope       noprint
+column p_win   new_value jobs_win    noprint
+column p_csrc  new_value cat_src     noprint
+column p_clab  new_value cat_label   noprint
+column p_cscr  new_value cat_script  noprint
+column p_fview new_value f_view      noprint
+column p_fsrc  new_value f_source    noprint
+column p_keep  new_value cat_keep    noprint
+column p_sess new_value cat_sess0   noprint
+-- Section F source: CONTROLFILE or CATALOG.  The password in &6 is only used in
+-- this statement (to derive the label user@tns or "wallet") and by the CONNECT.
 select to_number(nvl('&1', '60'))                    p_days,
        to_number(nvl('&2', '30'))                    p_gap,
        to_number(nvl('&3', to_char(d.dbid)))         p_dbid,
        to_number(nvl('&4', '0'))                     p_inst,
-       upper(nvl('&5', 'RMAN'))                      p_scope
-  from v$database d;
+       upper(nvl('&5', 'RMAN'))                      p_scope,
+       to_char(sysdate - to_number(nvl('&1', '60')), 'YYYY-MM-DD HH24:MI:SS') p_win,
+       case when c.s is null then 'CONTROLFILE' else 'CATALOG' end            p_csrc,
+       c.lab                                                                  p_clab,
+       case when c.s is null then 'awr_backup_catalog_skip.sql'
+            else 'awr_backup_catalog_connect.sql' end                         p_cscr,
+       case when c.s is null then 'V$RMAN_BACKUP_JOB_DETAILS'
+            else 'RC_RMAN_BACKUP_JOB_DETAILS' end                             p_fview,
+       case when c.s is null
+              then 'the controlfile of the target database (limited by control_file_record_keep_time)'
+            else 'RMAN recovery catalog ' || c.lab end                        p_fsrc,
+       (select max(value) from v$parameter where name = 'control_file_record_keep_time') p_keep,
+       to_char(sys_context('userenv', 'sessionid'))                           p_sess
+  from v$database d
+  cross join (select s,
+                     case when s is null then ''
+                          when nvl(instr(s, '/'), 0) = 1 or instr(s, '@') = 1
+                            then 'wallet (' || case when instr(s, '@', -1) > 0 then substr(s, instr(s, '@', -1) + 1) else 'local' end || ')'
+                          else substr(s, 1, least(nvl(nullif(instr(s, '/'), 0), 4000), nvl(nullif(instr(s, '@'), 0), 4000)) - 1)
+                               || '@' || case when instr(s, '@', -1) > 0 then substr(s, instr(s, '@', -1) + 1) else 'local' end
+                     end lab
+                from (select cast(q'~&6~' as varchar2(4000)) s from dual)) c;
+column p_win   clear
+column p_csrc  clear
+column p_clab  clear
+column p_cscr  clear
+column p_fview clear
+column p_fsrc  clear
+column p_keep  clear
+column p_sess clear
 column p_days  clear
 column p_gap   clear
 column p_dbid  clear
@@ -115,6 +176,7 @@ column 2 clear
 column 3 clear
 column 4 clear
 column 5 clear
+column 6 clear
 
 set termout on feedback 1
 
@@ -331,7 +393,11 @@ runs as (
          min(sample_dt)                                               run_start,
          max(sample_dt)                                               run_end,
          round((max(sample_dt) - min(sample_dt)) * 86400) + 10               elapsed_sec,
-         count(distinct case when channel <> '-' then channel end)    chans,
+         case when backup_type = 'RMAN client/catalog'                 then 0
+              when count(distinct case when channel <> '-' then channel end) > 0
+                                                                       then count(distinct case when channel <> '-' then channel end)
+              else count(distinct instance_number || '.' || session_id || '.' || session_serial#)
+         end                                                          chans,
          count(distinct instance_number || '.' || session_id || '.' || session_serial#) sess,
          listagg(distinct to_char(instance_number), ',')
            within group (order by to_char(instance_number))           insts,
@@ -526,10 +592,79 @@ having sum(total_waits - p_waits) > 0
  order by trunc(begin_interval_time), event_name;
 
 -- ----------------------------------------------------------------------------
+-- F is the last DB work of this script: with a catalog argument it CONNECTs to
+-- the RMAN recovery catalog first, so nothing that needs the target DB may follow.
 prompt
-prompt == F. CROSS-CHECK, NOT AWR: V$RMAN_BACKUP_JOB_DETAILS ==
-prompt      Source is the controlfile (limited by control_file_record_keep_time),
-prompt      not AWR.  Ground truth to compare with sections A and B.
+prompt == F. CROSS-CHECK, NOT AWR: &f_view ==
+prompt      Source: &f_source
+prompt      Not AWR.  Ground truth to compare with sections A and B.
+define cat_termout = OFF
+@@&cat_script
+-- A CONNECT re-runs glogin.sql, which may change SET options: set them again.
+set define '&' verify off echo off termout off feedback off heading on
+set trimspool on trimout on tab off
+set lines 250 pages 200 long 4000 numwidth 12
+set serveroutput off
+ttitle off
+btitle off
+repheader off
+repfooter off
+
+-- State of the source: CONTROLFILE / OK / NOT_REGISTERED / NO_ACCESS: <error>.
+-- Dynamic SQL, so this script never parses a view that does not exist where it runs.
+variable b_state varchar2(300)
+variable b_cnt   number
+variable b_first varchar2(20)
+variable b_last  varchar2(20)
+declare
+  l_reg number;
+begin
+  :b_state := 'OK';
+  :b_cnt   := 0;
+  if '&cat_src' <> 'CATALOG' then
+    :b_state := 'CONTROLFILE';
+    return;
+  end if;
+  if to_char(sys_context('userenv', 'sessionid')) = '&cat_sess0' then
+    :b_state := 'NO_CONNECT';
+    return;
+  end if;
+  begin
+    execute immediate 'select count(*) from rc_database where dbid = :1' into l_reg using &dbid;
+    if l_reg = 0 then
+      :b_state := 'NOT_REGISTERED';
+      return;
+    end if;
+    execute immediate 'select count(*), to_char(min(start_time), ''YYYY-MM-DD HH24:MI''), '
+      || 'to_char(max(start_time), ''YYYY-MM-DD HH24:MI'') from rc_rman_backup_job_details '
+      || 'where db_key in (select db_key from rc_database where dbid = :1)'
+      into :b_cnt, :b_first, :b_last using &dbid;
+  exception when others then
+    :b_state := 'NO_ACCESS: ' || replace(replace(replace(substr(sqlerrm, 1, 200), chr(39), ' '), chr(38), ' '), chr(34), ' ');
+  end;
+end;
+/
+column c_state  new_value cat_state  noprint
+column c_cnt    new_value cat_cnt    noprint
+column c_first  new_value cat_first  noprint
+column c_last   new_value cat_last   noprint
+column c_src    new_value jobs_src   noprint
+select :b_state c_state, nvl(:b_cnt, 0) c_cnt, nvl(:b_first, ' ') c_first, nvl(:b_last, ' ') c_last,
+       case when :b_state = 'CONTROLFILE'
+              then 'v$rman_backup_job_details'
+            when :b_state = 'OK'
+              then '(select * from rc_rman_backup_job_details where db_key in (select db_key from rc_database where dbid = &dbid))'
+            else '(select to_char(null) input_type, to_char(null) status, sysdate start_time, sysdate end_time, 0 elapsed_seconds, '
+                 || '0 input_bytes, 0 output_bytes, 0 input_bytes_per_sec, to_char(null) output_device_type from dual where 1 = 0)'
+       end c_src
+  from dual;
+column c_state  clear
+column c_cnt    clear
+column c_first  clear
+column c_last   clear
+column c_src    clear
+set termout on feedback off
+
 column input_type     format a16        heading 'INPUT TYPE'
 column status         format a24        heading 'STATUS'
 column jobs           format 99,990     heading 'JOBS'
@@ -540,8 +675,22 @@ column in_gb          format 9,999,990.00 heading 'INPUT GB'
 column out_gb         format 9,999,990.00 heading 'OUTPUT GB'
 column in_mbs         format 99,990.0   heading 'INPUT|MB/S'
 column keep_time      format a8         heading 'KEEP DAYS'
-select 'control_file_record_keep_time (days)' name, value keep_time
-  from v$parameter where name = 'control_file_record_keep_time';
+column cat_jobs       format 99,999,990 heading 'JOBS IN|CATALOG'
+column cat_first      format a16        heading 'OLDEST JOB'
+column cat_last       format a16        heading 'NEWEST JOB'
+column cat_who        format a40        heading 'RECOVERY CATALOG'
+column msg            format a100       heading 'NOTE' word_wrapped
+select 'control_file_record_keep_time (days)' name, '&cat_keep' keep_time
+  from dual where '&cat_state' = 'CONTROLFILE';
+select '&cat_label' cat_who, &cat_cnt cat_jobs, '&cat_first' cat_first, '&cat_last' cat_last
+  from dual where '&cat_state' = 'OK';
+select 'DBID ' || trim('&dbid') || ' is NOT registered in this recovery catalog, so there are no jobs to show.  Check the dbid argument or run REGISTER DATABASE.' msg
+  from dual where '&cat_state' = 'NOT_REGISTERED';
+select 'The CONNECT to the recovery catalog did not take effect (invalid connect string?), so no catalog data was read.' msg
+  from dual where '&cat_state' = 'NO_CONNECT';
+select 'Cannot read RC_DATABASE / RC_RMAN_BACKUP_JOB_DETAILS as &cat_label (needs the catalog owner or a virtual private catalog user).  ' || substr('&cat_state', 12) msg
+  from dual where '&cat_state' like 'NO_ACCESS%';
+set feedback 1
 
 prompt
 prompt F1. Summary per input type and status
@@ -552,8 +701,8 @@ select input_type, status,
        sum(elapsed_seconds) / 3600                                    tot_el_h,
        sum(input_bytes)  / power(1024, 3)                             in_gb,
        sum(output_bytes) / power(1024, 3)                             out_gb
-  from v$rman_backup_job_details
- where start_time >= sysdate - &days
+  from &jobs_src
+ where start_time >= to_date('&jobs_win', 'YYYY-MM-DD HH24:MI:SS')
  group by input_type, status
  order by input_type, status;
 
@@ -568,8 +717,8 @@ select input_type, status,
        input_bytes  / power(1024, 3)                                  in_gb,
        output_bytes / power(1024, 3)                                  out_gb,
        input_bytes_per_sec / 1048576                                  in_mbs
-  from v$rman_backup_job_details
- where start_time >= sysdate - &days
+  from &jobs_src
+ where start_time >= to_date('&jobs_win', 'YYYY-MM-DD HH24:MI:SS')
  order by start_time;
 
 prompt
