@@ -12,10 +12,12 @@ Five files report on RMAN / backup activity from AWR (`DBA_HIST_*`, needs the Di
 | --- | --- |
 | `awr_backup_overview.sql` | Text report (SQL*Plus, writes to stdout). |
 | `awr_backup_report_html.sql` | Same logic as a self-contained, offline HTML report (spools `awr_backup_report_<DB>_<yyyymmdd_hh24mi>.html`). |
-| `awr_backup_report.sh` | Bash wrapper that runs either or both on the database server. |
+| `awr_backup_report.sh` | Portable POSIX `sh` wrapper that runs either or both on the database server. |
 | `awr_backup_catalog_connect.sql`, `awr_backup_catalog_skip.sql` | Two tiny helpers the SQL scripts call (one of them, chosen by name) to connect to the recovery catalog or to do nothing. Keep all five files in one directory. |
 
 Both SQL scripts take `[days=60] [gap_minutes=30] [dbid=current] [inst=0 (all)] [scope=RMAN|ALL] [catalog]`; see their headers for details and limits.
+
+Requirements: a POSIX shell (`#!/bin/sh`) and the base OS tools only (`awk`, `sed`, `grep`, `cut`, `ls`, `stty`, ...), so it runs on AIX 7.2 (ksh88 `/bin/sh`) as well as Linux. It needs no bash, `readlink`, `realpath`, `mktemp` or `timeout`; the last two are used only if present. Tested with bash 3.2/5, ksh93, dash and zsh in sh mode, on Oracle Linux 9 against a real 19c database; **not yet run on a real AIX/ksh88**, so check it there first.
 
 Run the wrapper on the database server as an OS user in the `dba` group. It connects with OS authentication (`sqlplus -S -L / as sysdba`), so no password is needed. It sets the Oracle environment through `oraenv` (falling back to `/etc/oratab`) if `ORACLE_HOME` or `sqlplus` is missing, and finds the SQL files next to itself, also when called through a symlink.
 
@@ -40,8 +42,8 @@ RMAN_CATALOG_PASSWORD='...' ./awr_backup_report.sh -c rco@catdb    # cron
 ./awr_backup_report.sh -c /@catwallet                # wallet / external auth, no password
 ```
 
-* `-c` takes `user@tns_alias` (an EZConnect string works too) or `/@wallet_alias`. The password comes from `RMAN_CATALOG_PASSWORD`, else a `read -s` prompt (an error if stdin is not a terminal). It must not contain `"` or `'`.
-* The password is passed to sqlplus on stdin only: never on a command line, never in a file, and never printed. The reports show `user@tns` or `wallet (alias)` only, and the wrapper checks its outputs for the password at the end.
+* `-c` takes `user@tns_alias` (an EZConnect string works too) or `/@wallet_alias`. The password comes from `RMAN_CATALOG_PASSWORD`, else a prompt with terminal echo turned off via `stty` (an error if stdin is not a terminal). It must not contain `"` or `'`.
+* The password is passed to sqlplus on stdin only: never on a command line, never in a file, and never printed. It is written with a shell built-in (`printf`, or ksh's `print`); if the shell has neither, the wrapper stops with an error instead of risking it showing up in `ps`. The catalog check runs under `timeout 90` when `timeout` exists, otherwise without a limit of its own. The reports show `user@tns` or `wallet (alias)` only, and the wrapper checks its outputs for the password at the end.
 * Before the reports run, the wrapper logs in to the catalog in a separate sqlplus session and checks that `RC_RMAN_BACKUP_JOB_DETAILS` is readable (catalog owner or virtual private catalog user) and that the target DBID is in `RC_DATABASE`. A failed login (wrong password, unknown alias) is an error, exit status 1, with no fallback. If the login works but the DBID is not registered or the views are not readable, it prints a WARNING and runs with the controlfile as before.
 * The SQL scripts take the same connect string as the optional 6th argument, for example `@awr_backup_overview.sql 60 30 "" "" "" /@catwallet`. They read all AWR data first and CONNECT to the catalog as the last step. A failed login stops the script with exit status 1 (the HTML file is then incomplete). A password typed in that argument is visible in `ps` and must not contain `'`; prefer the wrapper or a wallet.
 * The window start is computed from the target's clock before the catalog connect, and the job times are shown as the catalog stores them; the clock and time zone of the catalog database are not used.

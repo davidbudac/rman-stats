@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # ============================================================================
 # awr_backup_report.sh
 #
@@ -8,6 +8,11 @@
 # as this script together with their two helpers awr_backup_catalog_connect.sql
 # and awr_backup_catalog_skip.sql (symlinks to the wrapper are fine).
 #
+# Portable POSIX shell: written for the AIX 7.2 /bin/sh (ksh88) as well as
+# Linux (bash, dash, ksh93) with only base OS tools.  No bash-isms, no GNU-only
+# options (readlink -f, mktemp, timeout and grep -o are used only if present or
+# not at all).  Run it as "./awr_backup_report.sh" or "sh awr_backup_report.sh".
+#
 # Connects with OS authentication (sqlplus -S -L / as sysdba), so no password.
 # Run it as an OS user that is a member of the dba / OSDBA group (normally the
 # oracle software owner).  Read-only; needs the Diagnostics Pack license.
@@ -16,13 +21,18 @@
 # NOT AWR) then comes from RC_RMAN_BACKUP_JOB_DETAILS in the catalog instead of
 # V$RMAN_BACKUP_JOB_DETAILS in the controlfile.  Everything else still comes
 # from AWR on the target.  The catalog password is taken from the environment
-# variable RMAN_CATALOG_PASSWORD (for cron) or asked for on the terminal; a
-# wallet (-c /@alias) needs none.  It is only ever passed to sqlplus on stdin
-# (never on a command line, never in a file) and never printed.  Before the
-# reports run, a separate sqlplus session checks the catalog: a failed login is
-# an error (exit 1, no fallback); a catalog that works but does not hold this DBID
-# or whose RC_ views cannot be read gives a WARNING and the reports fall back to
-# the controlfile.  Passwords containing a double or single quote are rejected.
+# variable RMAN_CATALOG_PASSWORD (for cron) or asked for on the terminal (echo
+# off via stty); a wallet (-c /@alias) needs none.  It is only ever passed to
+# sqlplus on stdin (never on a command line, never in a file) and never printed;
+# for that it is written with a shell built-in printf (or the ksh built-in
+# print), and the script stops with an error if neither is available rather than
+# let an external printf show it in "ps".  Before the reports run, a separate
+# sqlplus session checks the catalog: a failed login is an error (exit 1, no
+# fallback); a catalog that works but does not hold this DBID or whose RC_ views
+# cannot be read gives a WARNING and the reports fall back to the controlfile.
+# Passwords containing a double or single quote are rejected.  The catalog check
+# is run under "timeout 90" when that command exists; otherwise it has no time
+# limit of its own (the OS TCP timeout applies).
 #
 # Examples
 #   ./awr_backup_report.sh                          # HTML, last 60 days, $ORACLE_SID
@@ -39,7 +49,9 @@
 #            SQL error, or a missing output file.  Generated file paths are
 #            printed on stdout.
 # ============================================================================
-set -euo pipefail
+
+# No "set -e" / "set -u" / pipefail: they behave differently in ksh88, dash and
+# bash.  Every step that can fail is checked explicitly instead.
 
 PROG=${0##*/}
 
@@ -76,20 +88,85 @@ EOF
 die() { printf '%s: ERROR: %s\n' "$PROG" "$*" >&2; exit 1; }
 info() { printf '%s: %s\n' "$PROG" "$*" >&2; }
 
+# ---- cleanup: temp directory, terminal echo ------------------------------------
+tmp=""
+echo_off=0
+# shellcheck disable=SC2329  # invoked through the EXIT trap below
+cleanup() {
+  if [ "$echo_off" -eq 1 ]; then
+    stty echo 2>/dev/null
+    echo_off=0
+  fi
+  if [ -n "$tmp" ]; then rm -rf "$tmp"; fi
+  return 0
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# ---- writing a secret to a pipe without it showing up in "ps" -------------------
+# Where printf is an external command (ksh88 on AIX: /usr/bin/printf) the secret
+# would be on its command line.  So: shell built-in printf if there is one, else
+# the ksh built-in print, else refuse.  echo is not used (it interprets
+# backslashes in dash and ksh).
+secret_mode=""
+secret_init() {
+  si_t=$(LC_ALL=C; type printf 2>&1)
+  case $si_t in
+    *builtin*) secret_mode='printf'; return 0 ;;
+  esac
+  si_t=$(LC_ALL=C; type print 2>&1)
+  case $si_t in
+    *builtin*) secret_mode='print'; return 0 ;;
+  esac
+  return 1
+}
+secret_line() {   # secret_line TEXT: write TEXT and a newline to stdout
+  case $secret_mode in
+    printf) printf '%s\n' "$1" ;;
+    print)  print -r -- "$1" ;;
+    *)      return 1 ;;
+  esac
+}
+
 # ---- resolve the wrapper's real directory (follows symlinks, portable) ------
+# No readlink/realpath (not on AIX): the link target is read from "ls -ld".
 resolve_dir() {
-  local src=$1 dir target
-  while [ -L "$src" ]; do
-    dir=$(cd -P "$(dirname "$src")" && pwd)
-    target=$(readlink "$src")
-    case $target in
-      /*) src=$target ;;
-      *)  src=$dir/$target ;;
+  rd_src=$1
+  rd_n=0
+  while [ -L "$rd_src" ]; do
+    rd_n=$((rd_n + 1))
+    [ "$rd_n" -le 40 ] || { echo "too many levels of symbolic links: $1" >&2; return 1; }
+    case $rd_src in
+      */*) rd_dir=${rd_src%/*}; [ -n "$rd_dir" ] || rd_dir=/ ;;
+      *)   rd_dir=. ;;
+    esac
+    rd_ls=$(ls -ld "$rd_src") || return 1
+    # (the "->" sits in variables: a bare ">" inside ${...} trips some ksh parsers)
+    rd_arrow=" -> "
+    rd_pat="$rd_src$rd_arrow"
+    rd_target=${rd_ls#*"$rd_pat"}
+    if [ "$rd_target" = "$rd_ls" ]; then rd_target=${rd_ls#*"$rd_arrow"}; fi
+    case $rd_target in
+      /*) rd_src=$rd_target ;;
+      *)  rd_src=$rd_dir/$rd_target ;;
     esac
   done
-  cd -P "$(dirname "$src")" && pwd
+  case $rd_src in
+    */*) rd_dir=${rd_src%/*}; [ -n "$rd_dir" ] || rd_dir=/ ;;
+    *)   rd_dir=. ;;
+  esac
+  cd -P "$rd_dir" && pwd -P
 }
-SCRIPT_DIR=$(resolve_dir "${BASH_SOURCE[0]}")
+
+self=$0
+case $self in
+  */*) ;;
+  *) if [ -f "$self" ]; then self=./$self; else self=$(command -v "$self" 2>/dev/null) || self=$0; fi ;;
+esac
+SCRIPT_DIR=$(resolve_dir "$self") || die "cannot determine the directory of $0"
+[ -n "$SCRIPT_DIR" ] || die "cannot determine the directory of $0"
 
 # ---- options ----------------------------------------------------------------
 sid=${ORACLE_SID:-}
@@ -120,11 +197,24 @@ shift $((OPTIND - 1))
 [ $# -eq 0 ] || { die "unexpected argument: $1 (use -h for usage)"; }
 
 # ---- validation ---------------------------------------------------------------
-is_uint() { [[ $1 =~ ^[0-9]+$ ]]; }
-is_pos()  { is_uint "$1" && [ "$((10#$1))" -gt 0 ]; }
+is_uint() {   # non-empty, digits only
+  case $1 in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  return 0
+}
+is_pos() {    # digits only and not all zeros
+  is_uint "$1" || return 1
+  case $1 in
+    *[!0]*) return 0 ;;
+  esac
+  return 1
+}
 
 [ -n "$sid" ] || die "no SID: use -s SID or set ORACLE_SID"
-[[ $sid =~ ^[A-Za-z0-9_#$+-]+$ ]] || die "invalid SID: '$sid'"
+case $sid in
+  *[!A-Za-z0-9_#\$+-]*) die "invalid SID: '$sid'" ;;
+esac
 if [ -n "$days" ]; then is_pos "$days" || die "-d days must be a positive integer, got '$days'"; fi
 if [ -n "$gap" ];  then is_pos "$gap"  || die "-g gap_minutes must be a positive integer, got '$gap'"; fi
 if [ -n "$dbid" ]; then is_pos "$dbid" || die "-b dbid must be a positive integer, got '$dbid'"; fi
@@ -147,17 +237,26 @@ if [ -n "$catalog" ]; then
       */*) die "-c takes user@tns_alias without a password; set RMAN_CATALOG_PASSWORD or answer the prompt" ;;
     esac
   fi
-  [[ $cat_alias =~ ^[A-Za-z0-9_.#$:/+-]+$ ]] \
-    || die "-c: invalid TNS alias or EZConnect string '$cat_alias' (allowed: letters, digits and . _ # \$ : / + -)"
+  case $cat_alias in
+    ''|*[!A-Za-z0-9_.#\$:/+-]*)
+      die "-c: invalid TNS alias or EZConnect string '$cat_alias' (allowed: letters, digits and . _ # \$ : / + -)" ;;
+  esac
   if [ "$cat_wallet" -eq 0 ]; then
-    [[ $cat_user =~ ^[A-Za-z][A-Za-z0-9_#$]*$ ]] \
-      || die "-c: invalid catalog user '$cat_user' (expected a plain Oracle user name)"
+    case $cat_user in
+      ''|[!A-Za-z]*|*[!A-Za-z0-9_#\$]*)
+        die "-c: invalid catalog user '$cat_user' (expected a plain Oracle user name)" ;;
+    esac
     cat_label="$cat_user@$cat_alias"
   else
     cat_label="wallet ($cat_alias)"
   fi
 fi
 [ -n "$outdir" ] || die "-o output_dir must not be empty"
+
+# Take the catalog password out of the environment now, so that none of the
+# child processes started from here on (oraenv, sqlplus) inherit it.
+cat_pw_env=${RMAN_CATALOG_PASSWORD:-}
+unset RMAN_CATALOG_PASSWORD
 
 html_sql=$SCRIPT_DIR/awr_backup_report_html.sql
 text_sql=$SCRIPT_DIR/awr_backup_overview.sql
@@ -172,9 +271,9 @@ esac
 
 # ---- output directory ---------------------------------------------------------
 if [ ! -d "$outdir" ]; then
-  mkdir -p -- "$outdir" || die "cannot create output directory: $outdir"
+  mkdir -p "$outdir" || die "cannot create output directory: $outdir"
 fi
-outdir=$(cd -P -- "$outdir" && pwd) || die "cannot access output directory: $outdir"
+outdir=$(cd -P "$outdir" && pwd -P) || die "cannot access output directory: $outdir"
 [ -w "$outdir" ] || die "output directory is not writable: $outdir"
 case $outdir in
   *[\"\ ]*) die "output directory must not contain spaces or quotes: $outdir" ;;
@@ -189,85 +288,100 @@ command -v sqlplus >/dev/null 2>&1 || need_env=1
 if [ "$sid_from_opt" -eq 1 ] && [ "${ORACLE_SID:-}" != "$sid" ]; then need_env=1; fi
 
 oratab_home() {   # print ORACLE_HOME for SID $1 from oratab, fail if not found
-  local tab home
-  for tab in /etc/oratab /var/opt/oracle/oratab; do
-    [ -r "$tab" ] || continue
-    home=$(awk -F: -v s="$1" '$1 == s && $2 != "" && $1 !~ /^#/ { print $2; exit }' "$tab")
-    if [ -n "$home" ]; then printf '%s\n' "$home"; return 0; fi
+  for oh_tab in /etc/oratab /var/opt/oracle/oratab; do
+    [ -r "$oh_tab" ] || continue
+    oh_home=$(awk -F: -v s="$1" '$1 == s && $2 != "" && $1 !~ /^#/ { print $2; exit }' "$oh_tab")
+    if [ -n "$oh_home" ]; then printf '%s\n' "$oh_home"; return 0; fi
   done
   return 1
 }
 
-export ORACLE_SID="$sid"
+ORACLE_SID=$sid
+export ORACLE_SID
 if [ "$need_env" -eq 1 ]; then
-  # oraenv is not written for set -u, and may return non-zero harmlessly
-  if command -v oraenv >/dev/null 2>&1; then
-    set +u
-    export ORAENV_ASK=NO
-    # shellcheck disable=SC1091
-    . oraenv </dev/null >/dev/null 2>&1 || true
-    set -u
+  # oraenv may return non-zero harmlessly.  It is only sourced when it can be
+  # found and read: "." of a missing file ends a POSIX shell, "|| true" or not.
+  oe_file=$(command -v oraenv 2>/dev/null)
+  if [ -n "$oe_file" ] && [ -r "$oe_file" ]; then
+    ORAENV_ASK=NO
+    export ORAENV_ASK
+    # shellcheck disable=SC1090  # oraenv is found on PATH at run time
+    . "$oe_file" </dev/null >/dev/null 2>&1 || true
   fi
   if [ -z "${ORACLE_HOME:-}" ] || ! command -v sqlplus >/dev/null 2>&1; then
     if home=$(oratab_home "$sid"); then
-      export ORACLE_HOME=$home
-      export PATH="$ORACLE_HOME/bin:$PATH"
-      export LD_LIBRARY_PATH="$ORACLE_HOME/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+      ORACLE_HOME=$home
+      PATH="$ORACLE_HOME/bin:$PATH"
+      LD_LIBRARY_PATH="$ORACLE_HOME/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+      LIBPATH="$ORACLE_HOME/lib${LIBPATH:+:$LIBPATH}"   # AIX
+      export ORACLE_HOME PATH LD_LIBRARY_PATH LIBPATH
     fi
   fi
   # oraenv may have switched the SID (it keeps the one we exported)
-  export ORACLE_SID="$sid"
+  ORACLE_SID=$sid
+  export ORACLE_SID
 fi
 command -v sqlplus >/dev/null 2>&1 \
   || die "sqlplus not found: ORACLE_HOME/PATH not set and SID '$sid' could not be resolved via oraenv or oratab (/etc/oratab)"
 
 # ---- preflight: can we connect, and is the database open? ----------------------
-pre=$( ( cd -- "$outdir" && sqlplus -S -L / as sysdba <<'EOF'
-set heading off feedback off pagesize 0 verify off
-select 'INSTANCE_STATUS' || chr(61) || status from v$instance;
-select 'DB_ID' || chr(61) || dbid from v$database;
-exit
-EOF
-) 2>&1 || true )
+pre=$(cd "$outdir" && printf '%s\n' \
+    'set heading off feedback off pagesize 0 verify off' \
+    "select 'INSTANCE_STATUS' || chr(61) || status from v\$instance;" \
+    "select 'DB_ID' || chr(61) || dbid from v\$database;" \
+    'exit' | sqlplus -S -L / as sysdba 2>&1)
 case $pre in
   *INSTANCE_STATUS=OPEN*) ;;
   *INSTANCE_STATUS=*) die "instance '$sid' is not OPEN (${pre##*INSTANCE_STATUS=}); AWR data needs an open database" ;;
-  *) die "cannot connect to instance '$sid' as sysdba: $(printf '%s' "$pre" | grep -E 'ORA-|SP2-|rror' | head -n 1 | cut -c1-200)
+  *) die "cannot connect to instance '$sid' as sysdba: $(printf '%s\n' "$pre" | grep -E 'ORA-|SP2-|rror' | sed -n '1p' | cut -c1-200)
     (check -s / ORACLE_SID, that the instance is running, and that this OS user is in the dba/OSDBA group)" ;;
 esac
 
-pre_dbid=$(printf '%s\n' "$pre" | sed -n 's/^DB_ID=\([0-9][0-9]*\)[[:space:]]*$/\1/p' | head -n 1)
+pre_dbid=$(printf '%s\n' "$pre" | sed -n 's/^DB_ID=\([0-9][0-9]*\)[[:space:]]*$/\1/p' | sed -n '1p')
 
 # ---- optional recovery catalog: password and pre-flight --------------------------
-# The password only ever lives in shell variables and travels on pipes (printf is a
-# builtin, so it never shows up in a command line).  No file, no argv.
+# The password only ever lives in shell variables and travels on pipes, written by
+# a built-in (see secret_line), so it is never in a command line.  No file, no argv.
 cat_pw="" cat_conn="" cat_arg6=""
-scrub() {   # scrub TEXT: hide the catalog password in text before it is printed
-  local t=$1
-  if [ -n "$cat_pw" ]; then t=${t//"$cat_pw"/***}; fi
-  printf '%s' "$t"
+scrub() {   # scrub TEXT: hide the catalog password in a line of text before it is printed
+  if [ -z "$cat_pw" ]; then printf '%s' "$1"; return 0; fi
+  { secret_line "$cat_pw"; secret_line "$1"; } | awk '
+    NR == 1 { pw = $0; next }
+    { line = $0; out = ""
+      while ((i = index(line, pw)) > 0) { out = out substr(line, 1, i - 1) "***"; line = substr(line, i + length(pw)) }
+      printf "%s", out line }'
 }
 if [ -n "$catalog" ]; then
   if [ "$cat_wallet" -eq 1 ]; then
     cat_conn="/@$cat_alias"
     cat_arg6="\"/@$cat_alias\""
   else
-    if [ -n "${RMAN_CATALOG_PASSWORD:-}" ]; then
-      cat_pw=$RMAN_CATALOG_PASSWORD
+    secret_init || die "cannot handle the catalog password safely: this shell has neither a built-in printf nor a built-in print, so it could appear in a process listing; run under ksh93/bash/dash or use a wallet (-c /@alias)"
+    if [ -n "$cat_pw_env" ]; then
+      cat_pw=$cat_pw_env
     elif [ -t 0 ]; then
-      IFS= read -r -s -p "Password for RMAN catalog $cat_label: " cat_pw || die "no password read"
+      printf 'Password for RMAN catalog %s: ' "$cat_label" >&2
+      stty -echo || die "cannot turn off terminal echo for the password prompt"
+      echo_off=1
+      IFS= read -r cat_pw
+      read_rc=$?
+      stty echo 2>/dev/null
+      echo_off=0
       printf '\n' >&2
+      [ "$read_rc" -eq 0 ] || die "no password read"
     else
       die "no catalog password: set RMAN_CATALOG_PASSWORD, or run on a terminal to be prompted (or use a wallet: -c /@alias)"
     fi
-    # the variable must not leak into child processes
-    unset RMAN_CATALOG_PASSWORD
+    cat_pw_env=""
     [ -n "$cat_pw" ] || die "the catalog password is empty"
     case $cat_pw in
       *\"*|*\'*) die "the catalog password must not contain a double or single quote" ;;
     esac
+    nl='
+'
+    cr=$(printf '\r')
     case $cat_pw in
-      *$'\n'*|*$'\r'*) die "the catalog password must not contain a line break" ;;
+      *"$nl"*|*"$cr"*) die "the catalog password must not contain a line break" ;;
     esac
     cat_conn="$cat_user/\"$cat_pw\"@$cat_alias"
     # as a SQL*Plus script argument: wrapped in quotes, inner quotes doubled
@@ -279,19 +393,23 @@ if [ -n "$catalog" ]; then
   info "checking RMAN recovery catalog $cat_label for DBID $cat_dbid ..."
   tmo=""
   if command -v timeout >/dev/null 2>&1; then tmo="timeout 90"; fi
+  # the connect line holds the password: written with secret_line, not printf
   # shellcheck disable=SC2086  # $tmo is deliberately word-split ("timeout 90" or empty)
-  cat_out=$(printf '%s\n' \
-      'set define off heading off feedback off pagesize 0 verify off echo off termout on' \
-      'whenever sqlerror exit failure' \
-      "connect $cat_conn" \
-      'whenever sqlerror continue' \
-      "select 'CAT_LOGIN' || chr(61) || user from dual;" \
-      "select 'CAT_REGISTERED' || chr(61) || count(*) from rc_database where dbid = $cat_dbid;" \
-      "select 'CAT_JOBVIEW' || chr(61) || count(*) from rc_rman_backup_job_details where rownum = 1;" \
-      'exit' | $tmo sqlplus -S /nolog 2>&1 || true)
+  cat_out=$( {
+      printf '%s\n' \
+        'set define off heading off feedback off pagesize 0 verify off echo off termout on' \
+        'whenever sqlerror exit failure'
+      if [ -n "$cat_pw" ]; then secret_line "connect $cat_conn"; else printf '%s\n' "connect $cat_conn"; fi
+      printf '%s\n' \
+        'whenever sqlerror continue' \
+        "select 'CAT_LOGIN' || chr(61) || user from dual;" \
+        "select 'CAT_REGISTERED' || chr(61) || count(*) from rc_database where dbid = $cat_dbid;" \
+        "select 'CAT_JOBVIEW' || chr(61) || count(*) from rc_rman_backup_job_details where rownum = 1;" \
+        'exit'
+    } | $tmo sqlplus -S /nolog 2>&1 )
   case $cat_out in
     *CAT_LOGIN=*) ;;
-    *) die "cannot log in to the RMAN recovery catalog $cat_label: $(scrub "$(printf '%s' "$cat_out" | grep -E 'ORA-|SP2-|TNS-' | head -n 1 | cut -c1-200)")
+    *) die "cannot log in to the RMAN recovery catalog $cat_label: $(scrub "$(printf '%s\n' "$cat_out" | grep -E 'ORA-|SP2-|TNS-' | sed -n '1p' | cut -c1-200)")
     (a login failure is not retried against the controlfile: fix user, password or alias)" ;;
   esac
   cat_warn=""
@@ -313,25 +431,37 @@ if [ -n "$catalog" ]; then
 fi
 
 # ---- run helpers ----------------------------------------------------------------
-tmp=$(mktemp -d "${TMPDIR:-/tmp}/${PROG}.XXXXXX") || die "cannot create temp directory"
-trap 'rm -rf -- "$tmp"' EXIT
+# mktemp is not on every AIX; mkdir without -p fails if the name exists, so a
+# pre-created directory or symlink cannot be hijacked.  umask only in a subshell.
+tmp_base=${TMPDIR:-/tmp}
+if command -v mktemp >/dev/null 2>&1; then
+  tmp=$(mktemp -d "$tmp_base/awrbr.XXXXXX" 2>/dev/null) || tmp=""
+else
+  tmp_i=0
+  while [ "$tmp_i" -lt 20 ]; do
+    tmp_try=$tmp_base/awrbr.$$.$tmp_i
+    if (umask 077; mkdir "$tmp_try") 2>/dev/null; then tmp=$tmp_try; break; fi
+    tmp_i=$((tmp_i + 1))
+  done
+fi
+if [ -z "$tmp" ] || [ ! -d "$tmp" ]; then tmp=""; die "cannot create temp directory under $tmp_base"; fi
 
 # SQL*Plus positional args; "" = take the SQL script default
-args=$(printf '%s %s %s %s %s %s' "${days:-\"\"}" "${gap:-\"\"}" "${dbid:-\"\"}" "${inst:-\"\"}" "${scope:-\"\"}" "${cat_arg6:-\"\"}")
+dq='""'
+args="${days:-$dq} ${gap:-$dq} ${dbid:-$dq} ${inst:-$dq} ${scope:-$dq} ${cat_arg6:-$dq}"
 
 errors=0
 
 # scan_errors FILE LABEL: warn about lines starting with ORA-nnnnn / SP2-nnnn
 scan_errors() {
-  local file=$1 label=$2 hits
-  hits=$(grep -E '^[[:space:]]*(ORA|SP2)-[0-9]+' -- "$file" | cut -c1-300 | head -n 20 || true)
-  if [ -n "$hits" ]; then
+  se_hits=$(grep -E '^[[:space:]]*(ORA|SP2)-[0-9]+' "$2" 2>/dev/null | cut -c1-300 | sed '20q')
+  if [ -n "$se_hits" ]; then
     {
-      printf '%s: WARNING: ORA-/SP2- errors found in %s:\n' "$PROG" "$label"
-      printf '%s\n' "$hits" | sed 's/^/    /'
+      printf '%s: WARNING: ORA-/SP2- errors found in %s:\n' "$PROG" "$1"
+      printf '%s\n' "$se_hits" | sed 's/^/    /'
     } >&2
     errors=1
-    case $hits in
+    case $se_hits in
       *ORA-01034*|*ORA-12162*|*ORA-12547*|*ORA-27101*|*ORA-01031*|*ORA-01017*)
         info "hint: check that -s '$sid' is a running instance on this host, that ORACLE_HOME matches it, and that this OS user is in the dba/OSDBA group" ;;
     esac
@@ -339,12 +469,19 @@ scan_errors() {
 }
 
 run_sqlplus() {   # run_sqlplus SCRIPT -> stdout/stderr of sqlplus; returns its rc
-  # the script line goes in on stdin (it holds the catalog password, if any)
-  ( cd -- "$outdir" && printf '%s\n' "@$1 $args" 'exit' | sqlplus -S -L / as sysdba )
+  # the script line goes in on stdin (it holds the catalog password, if any);
+  # sqlplus is the last command of the pipeline, so its status is the result
+  (
+    cd "$outdir" || exit 1
+    {
+      if [ -n "$cat_pw" ]; then secret_line "@$1 $args"; else printf '%s\n' "@$1 $args"; fi
+      printf '%s\n' 'exit'
+    } | sqlplus -S -L / as sysdba
+  )
 }
 
 stamp=$(date +%Y%m%d_%H%M)
-produced=()
+set --    # from here on the positional parameters hold the list of produced files
 
 info "SID=$sid  days=${days:-60}  gap=${gap:-30}  dbid=${dbid:-current}  inst=${inst:-0}  scope=${scope:-RMAN}  format=$fmt  job source=${cat_label:+recovery catalog }${cat_label:-controlfile}"
 [ "$scope" != ALL ] || info "scope=ALL: validation mode, no RMAN filter"
@@ -354,12 +491,12 @@ if [ "$fmt" != text ]; then
   log=$tmp/html.log
   rc=0
   run_sqlplus "$html_sql" >"$log" 2>&1 || rc=$?
-  scan_errors "$log" "sqlplus output (html report)"
+  scan_errors "sqlplus output (html report)" "$log"
   [ "$rc" -eq 0 ] || { info "sqlplus exited with status $rc (html report)"; errors=1; }
-  name=$(sed -n 's/^Report written:[[:space:]]*//p' "$log" | tail -n 1)
+  name=$(sed -n 's/^Report written:[[:space:]]*//p' "$log" | sed -n '$p')
   if [ -n "$name" ] && [ -s "$outdir/$name" ]; then
-    scan_errors "$outdir/$name" "$name"
-    produced+=("$outdir/$name")
+    scan_errors "$name" "$outdir/$name"
+    set -- "$@" "$outdir/$name"
   else
     info "ERROR: HTML report was not produced (no 'Report written' line or file missing/empty)"
     errors=1
@@ -372,10 +509,10 @@ if [ "$fmt" != html ]; then
   txt=$outdir/awr_backup_overview_${sid}_${stamp}.txt
   rc=0
   run_sqlplus "$text_sql" >"$txt" 2>&1 || rc=$?
-  scan_errors "$txt" "$(basename "$txt")"
+  scan_errors "${txt##*/}" "$txt"
   [ "$rc" -eq 0 ] || { info "sqlplus exited with status $rc (text report)"; errors=1; }
   if [ -s "$txt" ]; then
-    produced+=("$txt")
+    set -- "$@" "$txt"
   else
     info "ERROR: text report was not produced (file missing/empty)"
     errors=1
@@ -383,20 +520,21 @@ if [ "$fmt" != html ]; then
 fi
 
 # ---- safety net: the catalog password must not be in any output --------------------
+# The password goes to awk on stdin ("-"), the file to search is its other operand.
 if [ -n "$cat_pw" ]; then
-  for f in "${produced[@]+"${produced[@]}"}" "$tmp"/*.log; do
+  for f in "$@" "$tmp"/*.log; do
     [ -f "$f" ] || continue
-    if grep -qF -f <(printf '%s\n' "$cat_pw") -- "$f" 2>/dev/null; then
-      info "ERROR: the catalog password was found in $(basename -- "$f"); removing it"
-      rm -f -- "$f"
-      produced=()
+    if secret_line "$cat_pw" | awk 'NR == FNR { pw = $0; next } index($0, pw) { found = 1; exit } END { exit !found }' - "$f" 2>/dev/null; then
+      info "ERROR: the catalog password was found in ${f##*/}; removing it"
+      rm -f "$f"
+      set --
       errors=1
     fi
   done
 fi
 
 # ---- result -----------------------------------------------------------------------
-for f in "${produced[@]+"${produced[@]}"}"; do
+for f in "$@"; do
   printf '%s\n' "$f"
 done
 
@@ -404,3 +542,4 @@ if [ "$errors" -ne 0 ]; then
   info "finished with errors"
   exit 1
 fi
+exit 0
