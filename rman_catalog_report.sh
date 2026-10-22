@@ -7,7 +7,7 @@ cat_pw=${RMAN_CATALOG_PASSWORD:-}
 unset RMAN_CATALOG_PASSWORD
 usage() {
   echo "Usage: $PROG -c user@alias -b DBID [-d days] [-o directory]"
-  echo '       -c /@wallet_alias is also supported; default window: 60 days.'
+  echo '       -c /@wallet_alias is also supported; default window: 90 days.'
   echo 'One DBID is required. Password: RMAN_CATALOG_PASSWORD or terminal prompt.'
 }
 die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
@@ -80,7 +80,7 @@ SCRIPT_DIR=$(resolve_dir "$self") || die "cannot determine the directory of $0"
 [ -n "$SCRIPT_DIR" ] || die "cannot determine the directory of $0"
 
 
-catalog='' dbid='' days=60 outdir=.
+catalog='' dbid='' days=90 outdir=.
 while getopts ':c:b:d:o:h' opt; do
   case $opt in
     c) catalog=$OPTARG ;; b) dbid=$OPTARG ;; d) days=$OPTARG ;;

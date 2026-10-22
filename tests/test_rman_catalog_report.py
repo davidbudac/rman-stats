@@ -36,7 +36,7 @@ assert 'RMAN_CATALOG_PASSWORD' not in os.environ
 assert 'SQLPATH' not in os.environ
 assert sys.argv[1:]==['-S','-L','-R','1','/nolog']
 assert 'as sysdba' not in s
-assert '@report.sql 123456789 60' in s
+assert '@report.sql 123456789 90' in s
 mode=os.environ.get('FAKE_MODE','ok')
 if mode=='login':
  print('ORA-01017 deliberately-sensitive-diagnostic');sys.exit(1)
