@@ -15,7 +15,15 @@
 #
 # Connects with OS authentication (sqlplus -S -L / as sysdba), so no password.
 # Run it as an OS user that is a member of the dba / OSDBA group (normally the
-# oracle software owner).  Read-only; needs the Diagnostics Pack license.
+# oracle software owner).  Read-only: the SQL scripts issue SELECTs only (plus
+# the optional CONNECT to the catalog); the wrapper writes nothing but the report
+# files and its own temp directory.  Needs the Diagnostics Pack license.
+#
+# SQL*Plus is always run from a private temp directory (mode 0700, under $TMPDIR
+# or /tmp) with restrict level 1 (-R 1: no HOST, !, EDIT), so no login.sql or
+# pre-created file/symlink in the output directory or the caller's directory can
+# be picked up; the reports are written there and moved to the output directory
+# when finished.
 #
 # Optional RMAN recovery catalog (-c): the cross-check section (RMAN job history,
 # NOT AWR) then comes from RC_RMAN_BACKUP_JOB_DETAILS in the catalog instead of
@@ -324,12 +332,32 @@ fi
 command -v sqlplus >/dev/null 2>&1 \
   || die "sqlplus not found: ORACLE_HOME/PATH not set and SID '$sid' could not be resolved via oraenv or oratab (/etc/oratab)"
 
+# ---- private work directory for sqlplus (mode 0700) -----------------------------
+# SQL*Plus runs here, never in the output directory or the caller's directory, so
+# that no login.sql and no pre-created file or symlink there can be picked up (it
+# runs as SYSDBA).  The reports are written here and moved to the output directory
+# when complete.
+# mktemp is not on every AIX; mkdir without -p fails if the name exists, so a
+# pre-created directory or symlink cannot be hijacked.  umask only in a subshell.
+tmp_base=${TMPDIR:-/tmp}
+if command -v mktemp >/dev/null 2>&1; then
+  tmp=$(mktemp -d "$tmp_base/awrbr.XXXXXX" 2>/dev/null) || tmp=""
+else
+  tmp_i=0
+  while [ "$tmp_i" -lt 20 ]; do
+    tmp_try=$tmp_base/awrbr.$$.$tmp_i
+    if (umask 077; mkdir "$tmp_try") 2>/dev/null; then tmp=$tmp_try; break; fi
+    tmp_i=$((tmp_i + 1))
+  done
+fi
+if [ -z "$tmp" ] || [ ! -d "$tmp" ]; then tmp=""; die "cannot create temp directory under $tmp_base"; fi
+
 # ---- preflight: can we connect, and is the database open? ----------------------
-pre=$(cd "$outdir" && printf '%s\n' \
+pre=$(cd "$tmp" && printf '%s\n' \
     'set heading off feedback off pagesize 0 verify off' \
     "select 'INSTANCE_STATUS' || chr(61) || status from v\$instance;" \
     "select 'DB_ID' || chr(61) || dbid from v\$database;" \
-    'exit' | sqlplus -S -L / as sysdba 2>&1)
+    'exit' | sqlplus -S -L -R 1 / as sysdba 2>&1)
 case $pre in
   *INSTANCE_STATUS=OPEN*) ;;
   *INSTANCE_STATUS=*) die "instance '$sid' is not OPEN (${pre##*INSTANCE_STATUS=}); AWR data needs an open database" ;;
@@ -406,7 +434,7 @@ if [ -n "$catalog" ]; then
         "select 'CAT_REGISTERED' || chr(61) || count(*) from rc_database where dbid = $cat_dbid;" \
         "select 'CAT_JOBVIEW' || chr(61) || count(*) from rc_rman_backup_job_details where rownum = 1;" \
         'exit'
-    } | $tmo sqlplus -S /nolog 2>&1 )
+    } | (cd "$tmp" && $tmo sqlplus -S -R 1 /nolog) 2>&1 )
   case $cat_out in
     *CAT_LOGIN=*) ;;
     *) die "cannot log in to the RMAN recovery catalog $cat_label: $(scrub "$(printf '%s\n' "$cat_out" | grep -E 'ORA-|SP2-|TNS-' | sed -n '1p' | cut -c1-200)")
@@ -429,22 +457,6 @@ if [ -n "$catalog" ]; then
     info "recovery catalog $cat_label OK: DBID $cat_dbid is registered"
   fi
 fi
-
-# ---- run helpers ----------------------------------------------------------------
-# mktemp is not on every AIX; mkdir without -p fails if the name exists, so a
-# pre-created directory or symlink cannot be hijacked.  umask only in a subshell.
-tmp_base=${TMPDIR:-/tmp}
-if command -v mktemp >/dev/null 2>&1; then
-  tmp=$(mktemp -d "$tmp_base/awrbr.XXXXXX" 2>/dev/null) || tmp=""
-else
-  tmp_i=0
-  while [ "$tmp_i" -lt 20 ]; do
-    tmp_try=$tmp_base/awrbr.$$.$tmp_i
-    if (umask 077; mkdir "$tmp_try") 2>/dev/null; then tmp=$tmp_try; break; fi
-    tmp_i=$((tmp_i + 1))
-  done
-fi
-if [ -z "$tmp" ] || [ ! -d "$tmp" ]; then tmp=""; die "cannot create temp directory under $tmp_base"; fi
 
 # SQL*Plus positional args; "" = take the SQL script default
 dq='""'
@@ -470,14 +482,26 @@ scan_errors() {
 
 run_sqlplus() {   # run_sqlplus SCRIPT -> stdout/stderr of sqlplus; returns its rc
   # the script line goes in on stdin (it holds the catalog password, if any);
-  # sqlplus is the last command of the pipeline, so its status is the result
+  # sqlplus is the last command of the pipeline, so its status is the result;
+  # it runs in the private work directory, so the HTML spool lands there
   (
-    cd "$outdir" || exit 1
+    cd "$tmp" || exit 1
     {
       if [ -n "$cat_pw" ]; then secret_line "@$1 $args"; else printf '%s\n' "@$1 $args"; fi
       printf '%s\n' 'exit'
-    } | sqlplus -S -L / as sysdba
+    } | sqlplus -S -L -R 1 / as sysdba
   )
+}
+
+publish() {   # publish SRC DEST: move a finished report from the work directory to the output directory
+  # mv replaces the directory entry, it never writes through a symlink; still refuse
+  # to replace anything that is not a plain file (symlink, directory, device).
+  if [ -L "$2" ] || { [ -e "$2" ] && [ ! -f "$2" ]; }; then
+    info "ERROR: refusing to replace $2: it exists and is not a regular file"
+    return 1
+  fi
+  mv -f "$1" "$2" || { info "ERROR: cannot move ${1##*/} to $2"; return 1; }
+  return 0
 }
 
 stamp=$(date +%Y%m%d_%H%M)
@@ -494,9 +518,10 @@ if [ "$fmt" != text ]; then
   scan_errors "sqlplus output (html report)" "$log"
   [ "$rc" -eq 0 ] || { info "sqlplus exited with status $rc (html report)"; errors=1; }
   name=$(sed -n 's/^Report written:[[:space:]]*//p' "$log" | sed -n '$p')
-  if [ -n "$name" ] && [ -s "$outdir/$name" ]; then
-    scan_errors "$name" "$outdir/$name"
-    set -- "$@" "$outdir/$name"
+  case $name in ''|*/*|.*) name="" ;; esac
+  if [ -n "$name" ] && [ -s "$tmp/$name" ]; then
+    scan_errors "$name" "$tmp/$name"
+    if publish "$tmp/$name" "$outdir/$name"; then set -- "$@" "$outdir/$name"; else errors=1; fi
   else
     info "ERROR: HTML report was not produced (no 'Report written' line or file missing/empty)"
     errors=1
@@ -508,11 +533,11 @@ fi
 if [ "$fmt" != html ]; then
   txt=$outdir/awr_backup_overview_${sid}_${stamp}.txt
   rc=0
-  run_sqlplus "$text_sql" >"$txt" 2>&1 || rc=$?
-  scan_errors "${txt##*/}" "$txt"
+  run_sqlplus "$text_sql" >"$tmp/text.out" 2>&1 || rc=$?
+  scan_errors "${txt##*/}" "$tmp/text.out"
   [ "$rc" -eq 0 ] || { info "sqlplus exited with status $rc (text report)"; errors=1; }
-  if [ -s "$txt" ]; then
-    set -- "$@" "$txt"
+  if [ -s "$tmp/text.out" ]; then
+    if publish "$tmp/text.out" "$txt"; then set -- "$@" "$txt"; else errors=1; fi
   else
     info "ERROR: text report was not produced (file missing/empty)"
     errors=1
@@ -522,7 +547,7 @@ fi
 # ---- safety net: the catalog password must not be in any output --------------------
 # The password goes to awk on stdin ("-"), the file to search is its other operand.
 if [ -n "$cat_pw" ]; then
-  for f in "$@" "$tmp"/*.log; do
+  for f in "$@" "$tmp"/*; do
     [ -f "$f" ] || continue
     if secret_line "$cat_pw" | awk 'NR == FNR { pw = $0; next } index($0, pw) { found = 1; exit } END { exit !found }' - "$f" 2>/dev/null; then
       info "ERROR: the catalog password was found in ${f##*/}; removing it"
