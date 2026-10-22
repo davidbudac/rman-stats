@@ -63,7 +63,14 @@
 --
 -- How runs are found
 --   Within one backup type, a new run starts when the gap since the previous
---   ASH sample is greater than gap_minutes (LAG plus a running SUM).
+--   ASH sample is greater than gap_minutes (LAG plus a running SUM).  Channel
+--   sessions are followed individually: when a session switches back to a type
+--   after working on another one (BACKUP DATABASE PLUS ARCHIVELOG runs
+--   archivelog, datafile, archivelog with the same channels), it continues an
+--   existing run of that type only if that run had a sample within the last
+--   rejoin_minutes (2, defined below); otherwise it starts a new run.  Without
+--   this the two archivelog phases would merge into one run whose elapsed time
+--   covered the whole datafile backup.
 --
 -- Limits - read before trusting the numbers
 --   * Needs the Diagnostics Pack license (AWR/ASH).
@@ -100,6 +107,11 @@ set define '&' verify off echo off termout off feedback off heading on
 set trimspool on trimout on tab off
 set lines 250 pages 200 long 4000 numwidth 12
 set serveroutput off
+-- A channel that switches back to a backup type after working on another
+-- type (BACKUP ... PLUS ARCHIVELOG) continues an existing run of that type
+-- only if the run had a sample within this many minutes; otherwise a new
+-- run starts.  Not a positional parameter on purpose.
+define rejoin_minutes = 2
 ttitle off
 btitle off
 repheader off
@@ -272,13 +284,33 @@ ash as (
           or lower(a.module) like 'backup%'  or lower(a.module) like 'restore%'
           or lower(a.module) like 'validate%' or lower(a.module) like 'rman%')
 ),
-flagged as (
+phased as (
+  -- Type of the previous sample of the same session ('RMAN client/catalog'
+  -- samples skipped).  Differs from backup_type when the channel switched
+  -- to this type from another one, e.g. the second archivelog phase of
+  -- BACKUP DATABASE PLUS ARCHIVELOG.
   select ash.*,
+         last_value(case when backup_type <> 'RMAN client/catalog' then backup_type end ignore nulls)
+           over (partition by instance_number, session_id, session_serial#
+                 order by sample_dt
+                 rows between unbounded preceding and 1 preceding)    prev_type
+    from ash
+),
+flagged as (
+  -- New run when the gap since the previous sample of the type is too big.
+  -- A session that just switched to this type from another one may only
+  -- continue a run that is still live (a sample within rejoin_minutes),
+  -- so the two archivelog phases around a datafile backup stay two runs.
+  select p.*,
          case when lag(sample_dt) over (partition by backup_type order by sample_dt) is null
                 or (sample_dt - lag(sample_dt) over (partition by backup_type order by sample_dt))
-                   * 1440 > &gap_minutes
+                   * 1440 > case when backup_type <> 'RMAN client/catalog'
+                                  and prev_type is not null
+                                  and prev_type <> backup_type
+                                 then least(&rejoin_minutes, &gap_minutes)
+                                 else &gap_minutes end
               then 1 else 0 end                                       new_run
-    from ash
+    from phased p
 ),
 numbered as (
   select f.*,
@@ -369,13 +401,33 @@ ash as (
           or lower(a.module) like 'backup%'  or lower(a.module) like 'restore%'
           or lower(a.module) like 'validate%' or lower(a.module) like 'rman%')
 ),
-flagged as (
+phased as (
+  -- Type of the previous sample of the same session ('RMAN client/catalog'
+  -- samples skipped).  Differs from backup_type when the channel switched
+  -- to this type from another one, e.g. the second archivelog phase of
+  -- BACKUP DATABASE PLUS ARCHIVELOG.
   select ash.*,
+         last_value(case when backup_type <> 'RMAN client/catalog' then backup_type end ignore nulls)
+           over (partition by instance_number, session_id, session_serial#
+                 order by sample_dt
+                 rows between unbounded preceding and 1 preceding)    prev_type
+    from ash
+),
+flagged as (
+  -- New run when the gap since the previous sample of the type is too big.
+  -- A session that just switched to this type from another one may only
+  -- continue a run that is still live (a sample within rejoin_minutes),
+  -- so the two archivelog phases around a datafile backup stay two runs.
+  select p.*,
          case when lag(sample_dt) over (partition by backup_type order by sample_dt) is null
                 or (sample_dt - lag(sample_dt) over (partition by backup_type order by sample_dt))
-                   * 1440 > &gap_minutes
+                   * 1440 > case when backup_type <> 'RMAN client/catalog'
+                                  and prev_type is not null
+                                  and prev_type <> backup_type
+                                 then least(&rejoin_minutes, &gap_minutes)
+                                 else &gap_minutes end
               then 1 else 0 end                                       new_run
-    from ash
+    from phased p
 ),
 numbered as (
   select f.*,

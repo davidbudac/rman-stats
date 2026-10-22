@@ -55,7 +55,10 @@
 --   number of distinct sessions.  Other RMAN sessions (MODULE 'RMAN$CATALOG' or
 --   'rman@host ...') are the type 'RMAN client/catalog'.  Within a type a
 --   new run starts when the gap since the previous ASH sample is greater than
---   gap_minutes.
+--   gap_minutes.  A channel that switches back to a type after working on
+--   another one (BACKUP DATABASE PLUS ARCHIVELOG) continues a run only if that
+--   run had a sample within the last 2 minutes (rejoin_minutes, defined below),
+--   so the two archivelog phases around a datafile backup are two runs.
 --
 -- Limits - read before trusting the numbers
 --   * Needs the Diagnostics Pack license (AWR/ASH).
@@ -88,6 +91,11 @@ set define '&' verify off echo off termout off feedback off heading on
 set trimspool on trimout on tab off
 set lines 250 pages 200 long 4000 numwidth 12
 set serveroutput off
+-- A channel that switches back to a backup type after working on another
+-- type (BACKUP ... PLUS ARCHIVELOG) continues an existing run of that type
+-- only if the run had a sample within this many minutes; otherwise a new
+-- run starts.  Not a positional parameter on purpose.
+define rejoin_minutes = 2
 ttitle off
 btitle off
 repheader off
@@ -434,13 +442,33 @@ ash as (
           or lower(a.module) like 'backup%'  or lower(a.module) like 'restore%'
           or lower(a.module) like 'validate%' or lower(a.module) like 'rman%')
 ),
-flagged as (
+phased as (
+  -- Type of the previous sample of the same session ('RMAN client/catalog'
+  -- samples skipped).  Differs from backup_type when the channel switched
+  -- to this type from another one, e.g. the second archivelog phase of
+  -- BACKUP DATABASE PLUS ARCHIVELOG.
   select ash.*,
+         last_value(case when backup_type <> 'RMAN client/catalog' then backup_type end ignore nulls)
+           over (partition by instance_number, session_id, session_serial#
+                 order by sample_dt
+                 rows between unbounded preceding and 1 preceding)    prev_type
+    from ash
+),
+flagged as (
+  -- New run when the gap since the previous sample of the type is too big.
+  -- A session that just switched to this type from another one may only
+  -- continue a run that is still live (a sample within rejoin_minutes),
+  -- so the two archivelog phases around a datafile backup stay two runs.
+  select p.*,
          case when lag(sample_dt) over (partition by backup_type order by sample_dt) is null
                 or (sample_dt - lag(sample_dt) over (partition by backup_type order by sample_dt))
-                   * 1440 > &gap_minutes
+                   * 1440 > case when backup_type <> 'RMAN client/catalog'
+                                  and prev_type is not null
+                                  and prev_type <> backup_type
+                                 then least(&rejoin_minutes, &gap_minutes)
+                                 else &gap_minutes end
               then 1 else 0 end                                       new_run
-    from ash
+    from phased p
 ),
 numbered as (
   select f.*,
@@ -1134,7 +1162,7 @@ prompt
 prompt // footer
 prompt function buildFoot(){
 prompt  $('#foot').innerHTML='<div><h3>Method</h3><ul><li>Backup type is the ASH <code>MODULE</code> of the session without its <code>: channel</code> suffix. The RMAN client session is its own type.</li>'
-prompt  +'<li>A new run starts when the gap since the previous sample of the same type exceeds '+M.gap+' minutes. Elapsed is last sample minus first sample plus 10 s.</li>'
+prompt  +'<li>A new run starts when the gap since the previous sample of the same type exceeds '+M.gap+' minutes. A channel that comes back to a type after working on another one (BACKUP DATABASE PLUS ARCHIVELOG) continues a run only if that run had a sample in the last 2 minutes, otherwise it starts a new run. Elapsed is last sample minus first sample plus 10 s.</li>'
 prompt  +'<li>Wait mix: ON CPU is CPU; User I/O and System I/O are IO; <code>Backup: MML</code> events are MML; everything else is other.</li>'
 prompt  +'<li>Authoritative IO is the snapshot delta of <code>DBA_HIST_IOSTAT_FUNCTION</code> function RMAN. Intervals across a restart or with a negative delta are dropped.</li></ul></div>'
 prompt  +'<div><h3>Read this before trusting the numbers</h3><ul><li>AWR keeps 1 in 10 ASH samples. Hours, GB and MB/s from ASH are sampled estimates; very short backups can be missed.</li>'
