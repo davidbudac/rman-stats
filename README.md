@@ -49,3 +49,24 @@ RMAN_CATALOG_PASSWORD='...' ./awr_backup_report.sh -c rco@catdb    # cron
 * The window start is computed from the target's clock before the catalog connect, and the job times are shown as the catalog stores them; the clock and time zone of the catalog database are not used.
 
 On Oracle 19c the ASH `MODULE` of RMAN channel sessions is `backup archivelog`, `backup full datafile` and so on, without the `: ORA_DISK_1` channel suffix that older releases add. The reports handle both; without a suffix the "channels" column counts distinct sessions.
+
+## Catalog-only HTML report (one database)
+
+`rman_catalog_report.sh` and `rman_catalog_report_html.sql` generate a self-contained offline HTML report using only `RC_DATABASE` and `RC_RMAN_BACKUP_JOB_DETAILS`. No target connection, SYSDBA or AWR queries are used. Keep the two files together and put SQL*Plus on `PATH`; the SQL targets an Oracle 19c catalog database.
+
+```sh
+./rman_catalog_report.sh -c rco@catdb -b 123456789
+./rman_catalog_report.sh -c /@catwallet -b 123456789 -d 30 -o /tmp/reports
+```
+
+Replace `123456789` with your database's DBID. One DBID is required; there is no implicit all-databases mode. To find it, connect to the catalog and run `select dbid, name from rc_database order by name;`. A missing or ambiguous DBID fails rather than broadening scope. Use the catalog owner or an account able to read both views.
+
+The default window is 60 days (`-d` accepts 1–3650). The report includes session and record counts, warning/error/failed counts, daily output and longest-duration charts, and searchable job records with type, status, timestamps, sizes and device. It does not infer incremental levels or backup recoverability. Times are displayed as stored; the window is based on the catalog database clock and includes records whose start time falls in the window. Catalog synchronization and retained history affect completeness.
+
+Passwords are prompted without echo or supplied through `RMAN_CATALOG_PASSWORD`; wallet connections need none. Passwords containing quotes or line breaks are rejected. Credentials travel on stdin, not command arguments, and are removed from the environment before launching child processes. Do not invoke with shell tracing. SQL*Plus runs in a private directory with `SQLPATH` and `ORACLE_PATH` unset; the Oracle installation's own `glogin.sql` must still be trusted. Errors stop generation without publishing partial output or printing raw connection diagnostics.
+
+The wrapper prints the absolute HTML path inside a new private output subdirectory. Open that file in a modern browser; JavaScript must be enabled, and no internet connection is needed.
+
+Validation: shell syntax, ShellCheck, offline wrapper tests with a fake SQL*Plus, and synthetic HTML preview. **Not yet validated against a live Oracle catalog or AIX/ksh88.** Run the offline tests with `python3 -m unittest discover -s tests -v`.
+
+Catalog column references: [RC_DATABASE](https://docs.oracle.com/en/database/oracle/oracle-database/19/rcmrf/RC_DATABASE.html), [RC_RMAN_BACKUP_JOB_DETAILS](https://docs.oracle.com/en/database/oracle/oracle-database/19/rcmrf/RC_RMAN_BACKUP_JOB_DETAILS.html).
