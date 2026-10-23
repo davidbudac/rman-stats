@@ -6,12 +6,14 @@ set define on echo off verify off feedback off heading off pagesize 0
 set linesize 32767 trimspool on tab off recsep off
 set serveroutput off
 variable selected_key number
-variable window_start date
-variable window_end date
+variable window_start varchar2(19)
+variable window_end varchar2(19)
+declare
+  report_end date := sysdate;
 begin
   select db_key into :selected_key from rc_database where dbid = &1;
-  :window_end := sysdate;
-  :window_start := :window_end - &2;
+  :window_end := to_char(report_end,'YYYY-MM-DD HH24:MI:SS');
+  :window_start := to_char(report_end - &2,'YYYY-MM-DD HH24:MI:SS');
 end;
 /
 spool report.html
@@ -23,8 +25,8 @@ prompt <noscript>Enable JavaScript to view this offline report.</noscript>
 prompt <script id="metadata" type="application/json">
 select replace(json_object(
   'dbid' value to_char(dbid), 'name' value name,
-  'from' value to_char(:window_start,'YYYY-MM-DD HH24:MI:SS'),
-  'to' value to_char(:window_end,'YYYY-MM-DD HH24:MI:SS')
+  'from' value :window_start,
+  'to' value :window_end
   returning varchar2(4000)), '<', '\u003c')
 from rc_database where db_key = :selected_key;
 prompt </script>
@@ -38,7 +40,8 @@ select replace(json_object(
   'output' value output_bytes returning varchar2(4000)), '<', '\u003c')
 from rc_rman_backup_job_details
 where db_key = :selected_key
-  and start_time >= :window_start and start_time <= :window_end
+  and start_time >= to_date(:window_start,'YYYY-MM-DD HH24:MI:SS')
+  and start_time <= to_date(:window_end,'YYYY-MM-DD HH24:MI:SS')
 order by start_time, session_key;
 prompt </script>
 set define off

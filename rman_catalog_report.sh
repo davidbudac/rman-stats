@@ -144,14 +144,25 @@ unset SQLPATH ORACLE_PATH
   secret_line 'whenever sqlerror exit failure rollback'
   secret_line 'whenever oserror exit failure rollback'
   secret_line "connect $cat_conn"
+  secret_line 'prompt RMANCAT_CONNECTED'
   secret_line "@report.sql $dbid $days"
   secret_line 'exit success'
 } | (cd "$tmp" && sqlplus -S -L -R 1 /nolog) >"$tmp/run.log" 2>&1
 rc=$?
-# Never print raw SQL*Plus diagnostics: malformed connection errors can echo secrets.
-[ "$rc" -eq 0 ] || die 'catalog report failed: check credentials, DBID, catalog access and Oracle version'
+# Print only error codes: malformed connection errors can echo credentials.
+report_failure() {
+  stage='before login completed'
+  if grep -q '^RMANCAT_CONNECTED[[:space:]]*$' "$tmp/run.log"; then
+    stage='after login completed, while generating the report'
+  fi
+  codes=$(awk '{line=$0; while (match(line, /(ORA|SP2|TNS)-[0-9]+/)) {
+    print substr(line,RSTART,RLENGTH); line=substr(line,RSTART+RLENGTH)
+  }}' "$tmp/run.log" | sort -u)
+  die "catalog report failed $stage (SQL*Plus exit $rc). Error codes: ${codes:-none captured}"
+}
+[ "$rc" -eq 0 ] || report_failure
 if grep -E 'ORA-[0-9]+|SP2-[0-9]+|TNS-[0-9]+' "$tmp/run.log" "$tmp/report.html" >/dev/null 2>&1; then
-  die 'SQL*Plus reported an error; no report published'
+  report_failure
 fi
 [ -s "$tmp/report.html" ] && grep -q '<!-- report-complete -->' "$tmp/report.html" || die 'incomplete report'
 if [ -n "$cat_pw" ]; then

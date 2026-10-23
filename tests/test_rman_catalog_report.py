@@ -24,6 +24,15 @@ def preview_html(rows):
 
 
 class WrapperTests(unittest.TestCase):
+    def test_sqlplus_bind_types(self):
+        # SQL*Plus VARIABLE supports no DATE type (unlike PL/SQL variables).
+        sql = (ROOT / 'rman_catalog_report_html.sql').read_text()
+        declarations = [line.lower().split() for line in sql.splitlines()
+                        if line.lower().startswith('variable ')]
+        supported = {'number', 'varchar2(19)'}
+        for declaration in declarations:
+            self.assertIn(declaration[2], supported)
+
     def test_contract(self):
         with tempfile.TemporaryDirectory() as directory:
             work = Path(directory)
@@ -40,7 +49,9 @@ assert '@report.sql 123456789 90' in s
 mode=os.environ.get('FAKE_MODE','ok')
 if mode=='login':
  print('ORA-01017 deliberately-sensitive-diagnostic');sys.exit(1)
-if mode=='sp2': print('SP2-0734: bad command')
+if mode=='sp2':
+ print('RMANCAT_CONNECTED')
+ print('SP2-0734: bad command')
 Path('report.html').write_text('<html>'+('' if mode=='partial' else '<!-- report-complete -->')+'</html>')
 ''')
             fake.chmod(0o700)
@@ -55,6 +66,12 @@ Path('report.html').write_text('<html>'+('' if mode=='partial' else '<!-- report
                 self.assertNotEqual(result.returncode, 0, mode)
                 self.assertEqual(result.stdout, '')
                 self.assertNotIn('deliberately-sensitive-diagnostic', result.stderr)
+                if mode == 'login':
+                    self.assertIn('before login completed', result.stderr)
+                    self.assertIn('ORA-01017', result.stderr)
+                if mode == 'sp2':
+                    self.assertIn('after login completed', result.stderr)
+                    self.assertIn('SP2-0734', result.stderr)
             for value in ['', '1;exit', '-1', '0', '12345678901']:
                 result = subprocess.run(['sh', str(ROOT / 'rman_catalog_report.sh'), '-c', '/@cat', '-b', value], env=env, capture_output=True)
                 self.assertNotEqual(result.returncode, 0)
