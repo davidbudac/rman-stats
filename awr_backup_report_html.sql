@@ -52,19 +52,25 @@
 --   DBA_HIST_ACTIVE_SESS_HISTORY (ASH) with a ': channel' suffix removed, if
 --   there is one.  Oracle 19c has no suffix (observed: MODULE 'backup archivelog',
 --   PROGRAM 'rman@host (TNS V1-V3)'), so the channel count then comes from the
---   number of distinct sessions.  Other RMAN sessions (MODULE 'RMAN$CATALOG' or
---   'rman@host ...') are the type 'RMAN client/catalog'.  Oracle labels
+--   number of distinct sessions.  Sessions with MODULE 'rman@host ...' or
+--   'RMAN$CATALOG' (or none) are the type 'RMAN client/catalog': the RMAN client
+--   and polling connections and, when the recovery catalog schema lives in this
+--   database or CDB, the catalog resyncs of every registered database.  They
+--   are active in short bursts for the whole job, so this type is reported by
+--   DB time only (no runs, no elapsed).  Other RMAN work keeps its MODULE as
+--   the type, e.g. 'recover ...' for RECOVER COPY OF DATABASE.  Oracle labels
 --   incremental backups of every level 'backup incr datafile', level 0
 --   included (observed on 19c; V$RMAN_BACKUP_JOB_DETAILS says 'DB INCR' in the
 --   same way), so 'backup full datafile' only covers BACKUP DATABASE /
 --   TABLESPACE / DATAFILE without the INCREMENTAL keyword.  Within a type a
 --   new run starts when the gap since the previous ASH sample is greater than
 --   gap_minutes; the decision is made once per sample second, so channels
---   sampled at the same instant always share a run.  A channel that switches
---   back to a type after working on
---   another one (BACKUP DATABASE PLUS ARCHIVELOG) continues a run only if that
---   run had a sample within the last 2 minutes (rejoin_minutes, defined below),
---   so the two archivelog phases around a datafile backup are two runs.  The
+--   sampled at the same instant always share a run.  When every channel
+--   sampled at a second is new to the type (a new RMAN job, or channels that
+--   come back from another type as in BACKUP DATABASE PLUS ARCHIVELOG) it
+--   continues a run only if that run had a sample within the last 2 minutes
+--   (rejoin_minutes, defined below), so back-to-back jobs and the two
+--   archivelog phases around a datafile backup are separate runs.  The
 --   same applies when a channel of the previous run left the type shortly
 --   before.
 --
@@ -372,7 +378,7 @@ prompt <div class="sec"><h2>Authoritative RMAN IO</h2><p>From DBA_HIST_IOSTAT_FU
 prompt <div class="card s7"><div class="ch"><div><h3>RMAN IO per day</h3><p>Function RMAN snapshot deltas (read and write GB) with the ASH estimate overlaid.</p></div></div><div id="ioday"></div><p class="note">Upper bound: function RMAN also counts non-backup IO such as controlfile autobackups, Data Guard role changes, flashback and recovery. Intervals spanning an instance restart are dropped.</p></div>
 prompt <div class="card s5"><div class="ch"><div><h3>RMAN wait events per day</h3><p>Instance-wide Backup: and RMAN events, snapshot deltas.</p></div><div id="wday-ctl"></div></div><div id="wday"></div></div>
 prompt <div class="sec"><h2>Detail</h2><p>Click a column header to sort.</p></div>
-prompt <div class="card"><div class="ch"><div><h3>Summary per backup type</h3><p>Estimates from ASH. MB/s is volume-weighted (total MB over total elapsed seconds).</p></div></div><div id="tbl-sum"></div></div>
+prompt <div class="card"><div class="ch"><div><h3>Summary per backup type</h3><p>Estimates from ASH. MB/s is volume-weighted (total MB over total elapsed seconds).</p></div></div><div id="tbl-sum"></div><p class="note" id="cli"></p></div>
 prompt <div class="card"><div class="ch"><div><h3>Run detail</h3><p>Filter by type, sort by any column.</p></div></div><div class="chips" id="chips"></div><div id="tbl-runs"></div></div>
 prompt <div class="sec"><h2 id="x-h2">Cross-check from the controlfile</h2><p>Not AWR. Use it as ground truth for the ASH-derived numbers above.</p></div>
 prompt <div class="card notawr"><div class="ch"><div><h3><span id="x-h3">V$RMAN_BACKUP_JOB_DETAILS</span><span class="badge">NOT AWR</span></h3><p id="x-sub"></p></div></div><div id="x-note"></div><div id="x-stats"></div><div id="x-gantt"></div><div id="x-tbl"></div></div>
@@ -425,10 +431,9 @@ with snaps as (
 ash as (
   select case
            when lower(a.module) like 'rman%'
-             or (lower(a.program) like 'rman%'
-                 and not regexp_like(lower(a.module), '^(backup|restore|validate)'))
+             or (a.module is null and lower(a.program) like 'rman%')
              then 'RMAN client/catalog'
-           else lower(trim(regexp_replace(nvl(a.module, '(no module)'), ':.*$')))
+           else nvl(lower(trim(regexp_replace(nvl(a.module, '(no module)'), ':.*$'))), '(no module)')
          end                                                          backup_type,
          nvl(trim(regexp_substr(a.module, ':(.*)$', 1, 1, null, 1)), '-') channel,
          cast(a.sample_time as date)                                  sample_dt,
@@ -475,15 +480,16 @@ seconds as (
   -- (per-row LAG and running SUM saw different orders and put a channel's
   -- first sample into the previous run of the type, stretching it for hours).
   -- phase_end: a session of the type left it after this sample (its next
-  -- sample has another type).  all_switched: every session sampled at this
-  -- second just switched to the type from another one.
+  -- sample has another type).  all_new: every session sampled at this
+  -- second is new to the type: it has no earlier sample at all (a new RMAN
+  -- job allocates new channel sessions) or it came from another type.
   select backup_type, sample_dt,
          max(case when backup_type <> 'RMAN client/catalog'
                    and next_type is not null and next_type <> backup_type
                   then 1 else 0 end)                                  phase_end,
          min(case when backup_type <> 'RMAN client/catalog'
-                   and prev_type is not null and prev_type <> backup_type
-                  then 1 else 0 end)                                  all_switched
+                   and (prev_type is null or prev_type <> backup_type)
+                  then 1 else 0 end)                                  all_new
     from phased
    group by backup_type, sample_dt
 ),
@@ -500,17 +506,17 @@ ended as (
 flagged as (
   -- New run when the gap since the previous sample second of the type is
   -- too big.  The allowed gap shrinks from gap_minutes to rejoin_minutes
-  -- when the run is probably over: every session sampled now just switched
-  -- to the type from another one, or a session of this type left it shortly
-  -- before the previous sample (so the previous run's channels have moved
-  -- on, e.g. to the datafile phase while an idle channel kept no samples at
-  -- all).  This keeps the two archivelog phases around a datafile backup as
-  -- two runs.
+  -- when the run is probably over: every session sampled now is new to the
+  -- type (a new RMAN job, or channels coming back from another type), or a
+  -- session of this type left it shortly before the previous sample (so the
+  -- previous run's channels have moved on, e.g. to the datafile phase while
+  -- an idle channel kept no samples at all).  This keeps back-to-back jobs
+  -- and the two archivelog phases around a datafile backup as separate runs.
   select e.*,
          case when prev_dt is null
                 or (sample_dt - prev_dt) * 1440
                    > case when backup_type <> 'RMAN client/catalog'
-                           and (   all_switched = 1
+                           and (   all_new = 1
                                 or (last_end_dt is not null
                                     and (prev_dt - last_end_dt) * 1440 <= &gap_minutes))
                           then least(&rejoin_minutes, &gap_minutes)
@@ -591,10 +597,9 @@ with snaps as (
 ash as (
   select case
            when lower(a.module) like 'rman%'
-             or (lower(a.program) like 'rman%'
-                 and not regexp_like(lower(a.module), '^(backup|restore|validate)'))
+             or (a.module is null and lower(a.program) like 'rman%')
              then 'RMAN client/catalog'
-           else lower(trim(regexp_replace(nvl(a.module, '(no module)'), ':.*$')))
+           else nvl(lower(trim(regexp_replace(nvl(a.module, '(no module)'), ':.*$'))), '(no module)')
          end                                                          backup_type,
          case when a.session_state = 'ON CPU'                         then 'CPU'
               when a.wait_class in ('User I/O', 'System I/O')         then 'IO'
@@ -808,14 +813,19 @@ prompt function sum(a,f){var t=0;for(var i=0;i<a.length;i++)t+=f(a[i])||0;return
 prompt function fday(s){return Math.floor(s/DAY)*DAY}
 prompt
 prompt // data preparation
-prompt var M=META;
-prompt var runs=RUNS.map(function(r,i){r.i=i;r.tot=r.rd+r.wr;r.mbs=r.tot*1024/r.el;return r});
+prompt var M=META,CLI='RMAN client/catalog';
+prompt var allRuns=RUNS.map(function(r,i){r.i=i;r.tot=r.rd+r.wr;r.mbs=r.tot*1024/r.el;return r});
+prompt // RMAN client/catalog sessions are active in short bursts for the whole job: runs and elapsed mean nothing for them, so keep them out of the backup runs and only sum their samples
+prompt var runs=allRuns.filter(function(r){return r.t!==CLI});
+prompt var cli={t:CLI,n:0,rd:0,wr:0,cpu:0,io:0,mml:0,oth:0,se:0,bursts:0,first:1e12,last:0,col:'var(--mute)'};
+prompt allRuns.forEach(function(r){if(r.t!==CLI)return;cli.n+=r.n;cli.rd+=r.rd;cli.wr+=r.wr;cli.cpu+=r.cpu;cli.io+=r.io;cli.mml+=r.mml;cli.oth+=r.oth;cli.se=Math.max(cli.se,r.se);cli.bursts++;if(r.s<cli.first)cli.first=r.s;if(r.e>cli.last)cli.last=r.e});
 prompt var tinfo={},tlist=[];
 prompt runs.forEach(function(r){var o=tinfo[r.t];if(!o){o=tinfo[r.t]={t:r.t,runs:0,el:0,rd:0,wr:0,n:0,cpu:0,io:0,mml:0,oth:0,first:1e12,last:0,min:1e12,max:0};tlist.push(o)}
 prompt  o.runs++;o.el+=r.el;o.rd+=r.rd;o.wr+=r.wr;o.n+=r.n;o.cpu+=r.cpu;o.io+=r.io;o.mml+=r.mml;o.oth+=r.oth;
 prompt  if(r.s<o.first)o.first=r.s;if(r.s>o.last)o.last=r.s;if(r.el<o.min)o.min=r.el;if(r.el>o.max)o.max=r.el});
 prompt tlist.sort(function(a,b){return b.el-a.el||(a.t<b.t?-1:1)});
 prompt tlist.forEach(function(o,i){o.ci=i<TOP?i+1:0;o.col=i<TOP?'var(--c'+(i+1)+')':'var(--other)'});
+prompt var slist=cli.n>0?tlist.concat([cli]):tlist; // types for the sample-based charts (wait mix, top events), client/catalog included
 prompt var OTH='__other',nOther=Math.max(0,tlist.length-TOP);
 prompt var groups=tlist.slice(0,TOP).map(function(o){return {k:o.t,label:o.t,col:o.col}});
 prompt if(nOther)groups.push({k:OTH,label:'Other ('+nOther+' type'+(nOther>1?'s':'')+')',col:'var(--other)'});
@@ -952,7 +962,7 @@ prompt function runTip(r){return tt(r.t,[[col(r.t),'Start',dt(r.s)],[null,'End',
 prompt  [null,'Sessions / channels',r.se+' / '+r.ch],[null,'Read / write (est.)',gbf(r.rd)+' / '+gbf(r.wr)+' GB'],[null,'Throughput (est.)',num(r.mbs,1)+' MB/s'],
 prompt  [null,'CPU / IO / MML / other',Math.round(100*r.cpu/r.n)+' / '+Math.round(100*r.io/r.n)+' / '+Math.round(100*r.mml/r.n)+' / '+Math.round(100*r.oth/r.n)+' %'],[null,'Top event',cut(r.ev,40)+' ('+Math.round(r.evp)+'%)']])}
 prompt chart('gantt',function(el){
-prompt  if(!hasRuns)return empty(el,M.scope==='RMAN'?'No RMAN sessions were found in AWR ASH history. Run with scope=ALL to preview the charts on any database.':'No ASH samples in the window.');
+prompt  if(!hasRuns)return empty(el,cli.n>0?'Only RMAN client/catalog sessions were sampled: no backup, restore or validate channels in the window.':M.scope==='RMAN'?'No RMAN sessions were found in AWR ASH history. Run with scope=ALL to preview the charts on any database.':'No ASH samples in the window.');
 prompt  var span=ST.gantt==='all'?M.now-M.win0:ST.gantt*DAY,x0=Math.max(M.win0,M.now-span);
 prompt  var lanes=tlist.filter(function(o){return runs.some(function(r){return r.t===o.t&&r.e+10>=x0})}).map(function(o){return {k:o.t,label:o.t,col:o.col}});
 prompt  if(!lanes.length)return empty(el,'No runs in the selected range.');
@@ -1056,23 +1066,23 @@ prompt
 prompt // wait profile + top events
 prompt var WC=[['cpu','CPU','var(--w-cpu)'],['io','IO','var(--w-io)'],['mml','Media manager (MML)','var(--w-mml)'],['oth','Other','var(--w-oth)']];
 prompt chart('waitmix',function(el){
-prompt  if(!hasRuns)return empty(el,'No ASH samples to classify.');
-prompt  var ts=tlist.slice().sort(function(a,b){return b.n-a.n}).slice(0,15);
+prompt  if(!slist.length)return empty(el,'No ASH samples to classify.');
+prompt  var ts=slist.slice().sort(function(a,b){return b.n-a.n}).slice(0,15);
 prompt  var h='<div class="lg">'+WC.map(function(c){return '<span class="lgs"><i class="dot" style="background:'+c[2]+'"></i>'+c[1]+'</span>'}).join('')+'</div><div class="wp">';
 prompt  ts.forEach(function(o){var seg='';WC.forEach(function(c){var v=o[c[0]],p=100*v/o.n;if(!v)return;
 prompt   seg+='<span style="width:'+p+'%;background:'+c[2]+'" data-t="'+esc(tt(o.t,[[c[2],c[1],num(p,1)+' %'],[null,'Samples',num(v)+' of '+num(o.n)]]))+'">'+(p>=9?Math.round(p)+'%':'')+'</span>'});
 prompt   h+='<div class="wr"><span class="nm" title="'+esc(o.t)+'"><span class="dot" style="background:'+o.col+'"></span>'+esc(o.t)+'</span><div class="tr">'+seg+'</div><span class="v">'+num(o.n*10/3600,1)+' h</span></div>'});
-prompt  h+='</div><p class="note">'+(tlist.length>ts.length?'Showing the '+ts.length+' types with most ASH samples out of '+tlist.length+'. ':'')+'Right column is estimated DB time (samples x 10 s).</p>';
+prompt  h+='</div><p class="note">'+(slist.length>ts.length?'Showing the '+ts.length+' types with most ASH samples out of '+slist.length+'. ':'')+'Right column is estimated DB time (samples x 10 s).</p>';
 prompt  el.innerHTML=h});
 prompt chart('topev',function(el){
 prompt  if(!EVENTS.length)return empty(el,'No wait events were sampled.');
 prompt  var by={};EVENTS.forEach(function(e){(by[e.t]=by[e.t]||[]).push(e)});
-prompt  var ts=tlist.slice().sort(function(a,b){return b.n-a.n}).slice(0,6),h='<div class="sm">';
+prompt  var ts=slist.slice().sort(function(a,b){return b.n-a.n}).slice(0,6),h='<div class="sm">';
 prompt  ts.forEach(function(o){var es=(by[o.t]||[]).slice(0,5);
 prompt   h+='<div><h4><span class="dot" style="background:'+o.col+'"></span><span class="t" title="'+esc(o.t)+'">'+esc(o.t)+'</span><em>'+num(o.n)+' samples</em></h4>';
 prompt   es.forEach(function(e){var p=100*e.n/e.tot;h+='<div class="eb" data-t="'+esc(tt(o.t,[[o.col,e.e,num(p,1)+' %'],[null,'Class',e.c],[null,'Samples',num(e.n)]]))+'"><span class="nm" title="'+esc(e.e)+'">'+esc(e.e)+'</span><span class="b"><i style="width:'+Math.max(1.5,p)+'%;background:'+o.col+'"></i></span><span class="p">'+Math.round(p)+'%</span></div>'});
 prompt   h+='</div>'});
-prompt  el.innerHTML=h+'</div>'+(tlist.length>ts.length?'<p class="note">Top '+ts.length+' of '+tlist.length+' types by ASH samples.</p>':'')});
+prompt  el.innerHTML=h+'</div>'+(slist.length>ts.length?'<p class="note">Top '+ts.length+' of '+slist.length+' types by ASH samples.</p>':'')});
 prompt
 prompt // authoritative IO per day (area)
 prompt chart('ioday',function(el){
@@ -1211,10 +1221,14 @@ prompt  {l:'Output GB',n:1,h:function(j){return gbf(j.out)},v:function(j){return
 prompt  {l:'Input MB/s',n:1,h:function(j){return num(j.mbs,1)},v:function(j){return j.mbs}},
 prompt  {l:'Device',h:function(j){return esc(j.dev||'')},v:function(j){return j.dev}}]});
 prompt
+prompt // RMAN client/catalog, by DB time only
+prompt function buildCli(){var el=$('#cli');if(!el)return;if(!cli.n){el.innerHTML='';return}
+prompt  el.innerHTML='<b>RMAN client/catalog</b> (RMAN client and polling connections, catalog resyncs): '+dur(cli.n*10)+' DB time in '+num(cli.bursts)+' burst'+(cli.bursts>1?'s':'')+', up to '+cli.se+' session'+(cli.se>1?'s':'')+' at a time, '+gbf(cli.rd)+' / '+gbf(cli.wr)+' GB read / written, first '+dt(cli.first)+', last '+dt(cli.last+10)+'. Measured by DB time only: these sessions are active in short bursts for the whole job, so runs and elapsed time mean nothing for them and they are left out of the runs, the elapsed charts and the IO estimates above.'+(cli.se>2?' Several sessions at a time usually means the recovery catalog schema lives in this database or CDB, so the resyncs of every registered database are sampled here.':'')}
+prompt
 prompt // footer
 prompt function buildFoot(){
-prompt  $('#foot').innerHTML='<div><h3>Method</h3><ul><li>Backup type is the ASH <code>MODULE</code> of the session without its <code>: channel</code> suffix. The RMAN client session is its own type. Oracle labels incremental backups of every level <code>backup incr datafile</code>, level 0 included, so <code>backup full datafile</code> only covers backups taken without the INCREMENTAL keyword.</li>'
-prompt  +'<li>A new run starts when the gap since the previous sample of the same type exceeds '+M.gap+' minutes; the decision is made once per sample second, so channels sampled at the same instant always share a run. A channel that comes back to a type after working on another one (BACKUP DATABASE PLUS ARCHIVELOG) continues a run only if that run had a sample in the last 2 minutes; the same applies when a channel of that run left the type shortly before. Otherwise a new run starts. Elapsed is last sample minus first sample plus 10 s.</li>'
+prompt  $('#foot').innerHTML='<div><h3>Method</h3><ul><li>Backup type is the ASH <code>MODULE</code> of the session without its <code>: channel</code> suffix. Sessions with MODULE <code>rman@host</code> or <code>RMAN$CATALOG</code> are the type RMAN client/catalog: the RMAN client, its polling connection and, when the recovery catalog lives in this database or CDB, the catalog resyncs of every registered database. They are active in short bursts for the whole job, so this type is reported by DB time only and kept out of the runs, the elapsed time and the charts built on them. Other RMAN work keeps its module as the type. Oracle labels incremental backups of every level <code>backup incr datafile</code>, level 0 included, so <code>backup full datafile</code> only covers backups taken without the INCREMENTAL keyword.</li>'
+prompt  +'<li>A new run starts when the gap since the previous sample of the same type exceeds '+M.gap+' minutes; the decision is made once per sample second, so channels sampled at the same instant always share a run. When every channel sampled at a second is new to the type (a new RMAN job, or channels coming back from another type as in BACKUP DATABASE PLUS ARCHIVELOG) it continues a run only if that run had a sample in the last 2 minutes; the same applies when a channel of that run left the type shortly before. Otherwise a new run starts, so back-to-back jobs stay separate. Elapsed is last sample minus first sample plus 10 s.</li>'
 prompt  +'<li>Wait mix: ON CPU is CPU; User I/O and System I/O are IO; <code>Backup: MML</code> events are MML; everything else is other.</li>'
 prompt  +'<li>Authoritative IO is the snapshot delta of <code>DBA_HIST_IOSTAT_FUNCTION</code> function RMAN. Intervals across a restart or with a negative delta are dropped.</li></ul></div>'
 prompt  +'<div><h3>Read this before trusting the numbers</h3><ul><li>AWR keeps 1 in 10 ASH samples. Hours, GB and MB/s from ASH are sampled estimates; very short backups can be missed.</li>'
@@ -1231,7 +1245,7 @@ prompt (function(){var h=location.hash.replace('#','');if(h==='dark'||h==='light
 prompt $('#theme').addEventListener('click',function(){ti=(ti+1)%3;setTheme(THEMES[ti]);try{localStorage.setItem('awrTheme',THEMES[ti])}catch(e){}});
 prompt
 prompt // go
-prompt buildTop();buildKpis();buildCross();buildFoot();drawSegs();drawChips();paintAll();
+prompt buildTop();buildKpis();buildCross();buildFoot();buildCli();drawSegs();drawChips();paintAll();
 prompt var rt;window.addEventListener('resize',function(){clearTimeout(rt);rt=setTimeout(function(){Object.keys(CH).forEach(function(id){var el=$('#'+id);if(el&&el.clientWidth!==el.__w)paint(id)})},120)});
 prompt }
 prompt </script>

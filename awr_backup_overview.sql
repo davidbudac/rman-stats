@@ -57,9 +57,14 @@
 --   archivelog', PROGRAM 'rman@host (TNS V1-V3)', ACTION '0000699 STARTED16').
 --   backup_type is MODULE with a ': channel' suffix removed, if there is one.
 --   Without a suffix the CHANNELS column counts distinct sessions instead (one
---   RMAN channel = one server session).  Other RMAN sessions (MODULE
---   'RMAN$CATALOG' or 'rman@host ...', PROGRAM 'rman@host (TNS V1-V3)') are
---   reported as the type 'RMAN client/catalog'.
+--   RMAN channel = one server session).  Sessions whose MODULE is 'rman@host
+--   ...' or 'RMAN$CATALOG' (or empty) are the type 'RMAN client/catalog': the
+--   RMAN client and polling connections and, when the recovery catalog schema
+--   lives in this database or CDB, the catalog resyncs of every registered
+--   database.  They are active in short bursts for the whole job, so this
+--   type is reported by DB time only; runs and elapsed time are not shown for
+--   it.  Any other RMAN work keeps its MODULE as the type (e.g. 'recover ...'
+--   for RECOVER COPY OF DATABASE), so it is not hidden in the client type.
 --   Oracle labels incremental backups of EVERY level 'backup incr datafile',
 --   level 0 included (observed on 19c), and V$RMAN_BACKUP_JOB_DETAILS calls
 --   them 'DB INCR' / 'DATAFILE INCR' in the same way.  So 'backup full
@@ -74,11 +79,13 @@
 --   decision is made once per sample second: ASH samples all active sessions
 --   at the same instant, so a type with several channels has several rows
 --   per second, and all of them must land in the same run.  Channel
---   sessions are followed individually: when a session switches back to a type
---   after working on another one (BACKUP DATABASE PLUS ARCHIVELOG runs
---   archivelog, datafile, archivelog with the same channels), it continues an
+--   sessions are followed individually.  When every session sampled at a
+--   second is new to the type (a new RMAN job allocates new channel sessions;
+--   BACKUP DATABASE PLUS ARCHIVELOG runs archivelog, datafile, archivelog with
+--   the same channels, so they come back from another type), it continues an
 --   existing run of that type only if that run had a sample within the last
---   rejoin_minutes (2, defined below); otherwise it starts a new run.  The
+--   rejoin_minutes (2, defined below); otherwise it starts a new run, so
+--   back-to-back jobs less than gap_minutes apart stay separate.  The
 --   same short gap applies when a channel of the previous run left the type
 --   shortly before (a channel that was idle during the datafile phase has no
 --   samples there, so this catches it too).  Without this the two archivelog
@@ -254,6 +261,7 @@ column min_el_min     format 999,990.0  heading 'MIN ELAP|(MIN)'
 column max_el_min     format 999,990.0  heading 'MAX ELAP|(MIN)'
 column tot_el_h       format 99,990.0   heading 'TOTAL ELAP|(HOURS)'
 column avg_db_min     format 999,990.0  heading 'AVG DB TIME|(MIN)'
+column tot_db_min     format 999,990.0  heading 'TOTAL DB|TIME (MIN)'
 column tot_rd_gb      format 99,999,990.0 heading 'TOTAL READ|GB (est)'
 column tot_wr_gb      format 99,999,990.0 heading 'TOTAL WRITE|GB (est)'
 column avg_rd_gb      format 99,990.00  heading 'AVG READ|GB/RUN'
@@ -272,10 +280,9 @@ with snaps as (
 ash as (
   select case
            when lower(a.module) like 'rman%'
-             or (lower(a.program) like 'rman%'
-                 and not regexp_like(lower(a.module), '^(backup|restore|validate)'))
+             or (a.module is null and lower(a.program) like 'rman%')
              then 'RMAN client/catalog'
-           else lower(trim(regexp_replace(nvl(a.module, '(no module)'), ':.*$')))
+           else nvl(lower(trim(regexp_replace(nvl(a.module, '(no module)'), ':.*$'))), '(no module)')
          end                                                          backup_type,
          nvl(trim(regexp_substr(a.module, ':(.*)$', 1, 1, null, 1)), '-') channel,
          cast(a.sample_time as date)                                  sample_dt,
@@ -322,15 +329,16 @@ seconds as (
   -- (per-row LAG and running SUM saw different orders and put a channel's
   -- first sample into the previous run of the type, stretching it for hours).
   -- phase_end: a session of the type left it after this sample (its next
-  -- sample has another type).  all_switched: every session sampled at this
-  -- second just switched to the type from another one.
+  -- sample has another type).  all_new: every session sampled at this
+  -- second is new to the type: it has no earlier sample at all (a new RMAN
+  -- job allocates new channel sessions) or it came from another type.
   select backup_type, sample_dt,
          max(case when backup_type <> 'RMAN client/catalog'
                    and next_type is not null and next_type <> backup_type
                   then 1 else 0 end)                                  phase_end,
          min(case when backup_type <> 'RMAN client/catalog'
-                   and prev_type is not null and prev_type <> backup_type
-                  then 1 else 0 end)                                  all_switched
+                   and (prev_type is null or prev_type <> backup_type)
+                  then 1 else 0 end)                                  all_new
     from phased
    group by backup_type, sample_dt
 ),
@@ -347,17 +355,17 @@ ended as (
 flagged as (
   -- New run when the gap since the previous sample second of the type is
   -- too big.  The allowed gap shrinks from gap_minutes to rejoin_minutes
-  -- when the run is probably over: every session sampled now just switched
-  -- to the type from another one, or a session of this type left it shortly
-  -- before the previous sample (so the previous run's channels have moved
-  -- on, e.g. to the datafile phase while an idle channel kept no samples at
-  -- all).  This keeps the two archivelog phases around a datafile backup as
-  -- two runs.
+  -- when the run is probably over: every session sampled now is new to the
+  -- type (a new RMAN job, or channels coming back from another type), or a
+  -- session of this type left it shortly before the previous sample (so the
+  -- previous run's channels have moved on, e.g. to the datafile phase while
+  -- an idle channel kept no samples at all).  This keeps back-to-back jobs
+  -- and the two archivelog phases around a datafile backup as separate runs.
   select e.*,
          case when prev_dt is null
                 or (sample_dt - prev_dt) * 1440
                    > case when backup_type <> 'RMAN client/catalog'
-                           and (   all_switched = 1
+                           and (   all_new = 1
                                 or (last_end_dt is not null
                                     and (prev_dt - last_end_dt) * 1440 <= &gap_minutes))
                           then least(&rejoin_minutes, &gap_minutes)
@@ -386,23 +394,32 @@ runs as (
     from numbered
    group by backup_type, run_no
 )
+-- 'RMAN client/catalog' is measured by DB time only: its run-based columns
+-- are left empty (see the note printed below the table).
 select backup_type,
-       count(*)                                                       runs,
-       avg(elapsed_sec) / 60                                          avg_el_min,
-       min(elapsed_sec) / 60                                          min_el_min,
-       max(elapsed_sec) / 60                                          max_el_min,
-       sum(elapsed_sec) / 3600                                        tot_el_h,
-       avg(db_time_sec) / 60                                          avg_db_min,
+       decode(backup_type, 'RMAN client/catalog', to_number(null), count(*))                 runs,
+       decode(backup_type, 'RMAN client/catalog', to_number(null), avg(elapsed_sec) / 60)    avg_el_min,
+       decode(backup_type, 'RMAN client/catalog', to_number(null), min(elapsed_sec) / 60)    min_el_min,
+       decode(backup_type, 'RMAN client/catalog', to_number(null), max(elapsed_sec) / 60)    max_el_min,
+       decode(backup_type, 'RMAN client/catalog', to_number(null), sum(elapsed_sec) / 3600)  tot_el_h,
+       decode(backup_type, 'RMAN client/catalog', to_number(null), avg(db_time_sec) / 60)    avg_db_min,
+       sum(db_time_sec) / 60                                          tot_db_min,
        sum(rd_bytes) / power(1024, 3)                                 tot_rd_gb,
        sum(wr_bytes) / power(1024, 3)                                 tot_wr_gb,
-       avg(rd_bytes) / power(1024, 3)                                 avg_rd_gb,
-       avg(wr_bytes) / power(1024, 3)                                 avg_wr_gb,
-       avg((rd_bytes + wr_bytes) / 1048576 / elapsed_sec)             avg_mbs,
+       decode(backup_type, 'RMAN client/catalog', to_number(null), avg(rd_bytes) / power(1024, 3)) avg_rd_gb,
+       decode(backup_type, 'RMAN client/catalog', to_number(null), avg(wr_bytes) / power(1024, 3)) avg_wr_gb,
+       decode(backup_type, 'RMAN client/catalog', to_number(null),
+              avg((rd_bytes + wr_bytes) / 1048576 / elapsed_sec))    avg_mbs,
        to_char(min(run_start), 'YYYY-MM-DD HH24:MI')                  first_run,
        to_char(max(run_start), 'YYYY-MM-DD HH24:MI')                  last_run
   from runs
  group by backup_type
- order by sum(elapsed_sec) desc, backup_type;
+ order by decode(backup_type, 'RMAN client/catalog', 1, 0), sum(elapsed_sec) desc, backup_type;
+
+prompt      RMAN client/catalog = sessions with MODULE 'rman@host ...' or 'RMAN$CATALOG': the RMAN client and
+prompt      polling connections and, when the recovery catalog schema lives in this database or CDB, the catalog
+prompt      resyncs of every registered database.  They are active in short bursts for the whole job, so runs and
+prompt      elapsed time mean nothing for them: only DB time and IO are shown, and they are not listed in B.
 
 -- ----------------------------------------------------------------------------
 prompt
@@ -433,10 +450,9 @@ with snaps as (
 ash as (
   select case
            when lower(a.module) like 'rman%'
-             or (lower(a.program) like 'rman%'
-                 and not regexp_like(lower(a.module), '^(backup|restore|validate)'))
+             or (a.module is null and lower(a.program) like 'rman%')
              then 'RMAN client/catalog'
-           else lower(trim(regexp_replace(nvl(a.module, '(no module)'), ':.*$')))
+           else nvl(lower(trim(regexp_replace(nvl(a.module, '(no module)'), ':.*$'))), '(no module)')
          end                                                          backup_type,
          nvl(trim(regexp_substr(a.module, ':(.*)$', 1, 1, null, 1)), '-') channel,
          cast(a.sample_time as date)                                  sample_dt,
@@ -483,15 +499,16 @@ seconds as (
   -- (per-row LAG and running SUM saw different orders and put a channel's
   -- first sample into the previous run of the type, stretching it for hours).
   -- phase_end: a session of the type left it after this sample (its next
-  -- sample has another type).  all_switched: every session sampled at this
-  -- second just switched to the type from another one.
+  -- sample has another type).  all_new: every session sampled at this
+  -- second is new to the type: it has no earlier sample at all (a new RMAN
+  -- job allocates new channel sessions) or it came from another type.
   select backup_type, sample_dt,
          max(case when backup_type <> 'RMAN client/catalog'
                    and next_type is not null and next_type <> backup_type
                   then 1 else 0 end)                                  phase_end,
          min(case when backup_type <> 'RMAN client/catalog'
-                   and prev_type is not null and prev_type <> backup_type
-                  then 1 else 0 end)                                  all_switched
+                   and (prev_type is null or prev_type <> backup_type)
+                  then 1 else 0 end)                                  all_new
     from phased
    group by backup_type, sample_dt
 ),
@@ -508,17 +525,17 @@ ended as (
 flagged as (
   -- New run when the gap since the previous sample second of the type is
   -- too big.  The allowed gap shrinks from gap_minutes to rejoin_minutes
-  -- when the run is probably over: every session sampled now just switched
-  -- to the type from another one, or a session of this type left it shortly
-  -- before the previous sample (so the previous run's channels have moved
-  -- on, e.g. to the datafile phase while an idle channel kept no samples at
-  -- all).  This keeps the two archivelog phases around a datafile backup as
-  -- two runs.
+  -- when the run is probably over: every session sampled now is new to the
+  -- type (a new RMAN job, or channels coming back from another type), or a
+  -- session of this type left it shortly before the previous sample (so the
+  -- previous run's channels have moved on, e.g. to the datafile phase while
+  -- an idle channel kept no samples at all).  This keeps back-to-back jobs
+  -- and the two archivelog phases around a datafile backup as separate runs.
   select e.*,
          case when prev_dt is null
                 or (sample_dt - prev_dt) * 1440
                    > case when backup_type <> 'RMAN client/catalog'
-                           and (   all_switched = 1
+                           and (   all_new = 1
                                 or (last_end_dt is not null
                                     and (prev_dt - last_end_dt) * 1440 <= &gap_minutes))
                           then least(&rejoin_minutes, &gap_minutes)
@@ -581,6 +598,7 @@ select backup_type,
        (rd_bytes + wr_bytes) / 1048576 / elapsed_sec                  mbs,
        substr(top_ev, 1, 36) || ' (' || round(top_ev_pct) || '%)'     top_event
   from runs
+ where backup_type <> 'RMAN client/catalog'
  order by run_start, backup_type;
 
 -- ----------------------------------------------------------------------------
