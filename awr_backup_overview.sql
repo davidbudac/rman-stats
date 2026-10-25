@@ -60,10 +60,20 @@
 --   RMAN channel = one server session).  Other RMAN sessions (MODULE
 --   'RMAN$CATALOG' or 'rman@host ...', PROGRAM 'rman@host (TNS V1-V3)') are
 --   reported as the type 'RMAN client/catalog'.
+--   Oracle labels incremental backups of EVERY level 'backup incr datafile',
+--   level 0 included (observed on 19c), and V$RMAN_BACKUP_JOB_DETAILS calls
+--   them 'DB INCR' / 'DATAFILE INCR' in the same way.  So 'backup full
+--   datafile' only covers BACKUP DATABASE / TABLESPACE / DATAFILE without the
+--   INCREMENTAL keyword.  A site whose weekly "full" is BACKUP INCREMENTAL
+--   LEVEL 0 sees it under 'backup incr datafile'; neither source tells the
+--   levels apart.
 --
 -- How runs are found
 --   Within one backup type, a new run starts when the gap since the previous
---   ASH sample is greater than gap_minutes (LAG plus a running SUM).  Channel
+--   ASH sample is greater than gap_minutes (LAG plus a running SUM).  The
+--   decision is made once per sample second: ASH samples all active sessions
+--   at the same instant, so a type with several channels has several rows
+--   per second, and all of them must land in the same run.  Channel
 --   sessions are followed individually: when a session switches back to a type
 --   after working on another one (BACKUP DATABASE PLUS ARCHIVELOG runs
 --   archivelog, datafile, archivelog with the same channels), it continues an
@@ -304,34 +314,50 @@ phased as (
                  rows between 1 following and unbounded following)    next_type
     from ash
 ),
-ended as (
-  -- Time of the last sample, before this one, at which a session of this
-  -- type left the type (its next sample has another type).
-  select p.*,
-         case when backup_type <> 'RMAN client/catalog'
-               and next_type is not null and next_type <> backup_type
-              then 1 else 0 end                                       phase_end,
-         lag(sample_dt) over (partition by backup_type order by sample_dt) prev_dt,
+seconds as (
+  -- One row per backup type and sample second.  ASH samples all active
+  -- sessions at the same instant, so a type with several channels has
+  -- several rows per second.  The run decision below is made once per
+  -- second, so it cannot depend on the arbitrary order of same-second rows
+  -- (per-row LAG and running SUM saw different orders and put a channel's
+  -- first sample into the previous run of the type, stretching it for hours).
+  -- phase_end: a session of the type left it after this sample (its next
+  -- sample has another type).  all_switched: every session sampled at this
+  -- second just switched to the type from another one.
+  select backup_type, sample_dt,
          max(case when backup_type <> 'RMAN client/catalog'
                    and next_type is not null and next_type <> backup_type
-                  then sample_dt end)
+                  then 1 else 0 end)                                  phase_end,
+         min(case when backup_type <> 'RMAN client/catalog'
+                   and prev_type is not null and prev_type <> backup_type
+                  then 1 else 0 end)                                  all_switched
+    from phased
+   group by backup_type, sample_dt
+),
+ended as (
+  -- Previous sample second of the type, and the last second before this one
+  -- at which a session of the type left it.
+  select s.*,
+         lag(sample_dt) over (partition by backup_type order by sample_dt) prev_dt,
+         max(case when phase_end = 1 then sample_dt end)
            over (partition by backup_type order by sample_dt
                  rows between unbounded preceding and 1 preceding)    last_end_dt
-    from phased p
+    from seconds s
 ),
 flagged as (
-  -- New run when the gap since the previous sample of the type is too big.
-  -- The allowed gap shrinks from gap_minutes to rejoin_minutes when the run
-  -- is probably over: this session just switched to the type from another
-  -- one, or a session of this type left it shortly before the previous
-  -- sample (so the previous run's channels have moved on, e.g. to the
-  -- datafile phase while an idle channel kept no samples at all).  This
-  -- keeps the two archivelog phases around a datafile backup as two runs.
+  -- New run when the gap since the previous sample second of the type is
+  -- too big.  The allowed gap shrinks from gap_minutes to rejoin_minutes
+  -- when the run is probably over: every session sampled now just switched
+  -- to the type from another one, or a session of this type left it shortly
+  -- before the previous sample (so the previous run's channels have moved
+  -- on, e.g. to the datafile phase while an idle channel kept no samples at
+  -- all).  This keeps the two archivelog phases around a datafile backup as
+  -- two runs.
   select e.*,
          case when prev_dt is null
                 or (sample_dt - prev_dt) * 1440
                    > case when backup_type <> 'RMAN client/catalog'
-                           and (   (prev_type is not null and prev_type <> backup_type)
+                           and (   all_switched = 1
                                 or (last_end_dt is not null
                                     and (prev_dt - last_end_dt) * 1440 <= &gap_minutes))
                           then least(&rejoin_minutes, &gap_minutes)
@@ -340,10 +366,14 @@ flagged as (
     from ended e
 ),
 numbered as (
-  select f.*,
-         sum(new_run) over (partition by backup_type order by sample_dt
-                            rows unbounded preceding)                 run_no
-    from flagged f
+  -- Run number per sample second, then back to the individual samples.
+  select p.*, r.run_no
+    from phased p
+    join (select backup_type, sample_dt,
+                 sum(new_run) over (partition by backup_type order by sample_dt
+                                    rows unbounded preceding)         run_no
+            from flagged) r
+      on r.backup_type = p.backup_type and r.sample_dt = p.sample_dt
 ),
 runs as (
   select backup_type, run_no,
@@ -445,34 +475,50 @@ phased as (
                  rows between 1 following and unbounded following)    next_type
     from ash
 ),
-ended as (
-  -- Time of the last sample, before this one, at which a session of this
-  -- type left the type (its next sample has another type).
-  select p.*,
-         case when backup_type <> 'RMAN client/catalog'
-               and next_type is not null and next_type <> backup_type
-              then 1 else 0 end                                       phase_end,
-         lag(sample_dt) over (partition by backup_type order by sample_dt) prev_dt,
+seconds as (
+  -- One row per backup type and sample second.  ASH samples all active
+  -- sessions at the same instant, so a type with several channels has
+  -- several rows per second.  The run decision below is made once per
+  -- second, so it cannot depend on the arbitrary order of same-second rows
+  -- (per-row LAG and running SUM saw different orders and put a channel's
+  -- first sample into the previous run of the type, stretching it for hours).
+  -- phase_end: a session of the type left it after this sample (its next
+  -- sample has another type).  all_switched: every session sampled at this
+  -- second just switched to the type from another one.
+  select backup_type, sample_dt,
          max(case when backup_type <> 'RMAN client/catalog'
                    and next_type is not null and next_type <> backup_type
-                  then sample_dt end)
+                  then 1 else 0 end)                                  phase_end,
+         min(case when backup_type <> 'RMAN client/catalog'
+                   and prev_type is not null and prev_type <> backup_type
+                  then 1 else 0 end)                                  all_switched
+    from phased
+   group by backup_type, sample_dt
+),
+ended as (
+  -- Previous sample second of the type, and the last second before this one
+  -- at which a session of the type left it.
+  select s.*,
+         lag(sample_dt) over (partition by backup_type order by sample_dt) prev_dt,
+         max(case when phase_end = 1 then sample_dt end)
            over (partition by backup_type order by sample_dt
                  rows between unbounded preceding and 1 preceding)    last_end_dt
-    from phased p
+    from seconds s
 ),
 flagged as (
-  -- New run when the gap since the previous sample of the type is too big.
-  -- The allowed gap shrinks from gap_minutes to rejoin_minutes when the run
-  -- is probably over: this session just switched to the type from another
-  -- one, or a session of this type left it shortly before the previous
-  -- sample (so the previous run's channels have moved on, e.g. to the
-  -- datafile phase while an idle channel kept no samples at all).  This
-  -- keeps the two archivelog phases around a datafile backup as two runs.
+  -- New run when the gap since the previous sample second of the type is
+  -- too big.  The allowed gap shrinks from gap_minutes to rejoin_minutes
+  -- when the run is probably over: every session sampled now just switched
+  -- to the type from another one, or a session of this type left it shortly
+  -- before the previous sample (so the previous run's channels have moved
+  -- on, e.g. to the datafile phase while an idle channel kept no samples at
+  -- all).  This keeps the two archivelog phases around a datafile backup as
+  -- two runs.
   select e.*,
          case when prev_dt is null
                 or (sample_dt - prev_dt) * 1440
                    > case when backup_type <> 'RMAN client/catalog'
-                           and (   (prev_type is not null and prev_type <> backup_type)
+                           and (   all_switched = 1
                                 or (last_end_dt is not null
                                     and (prev_dt - last_end_dt) * 1440 <= &gap_minutes))
                           then least(&rejoin_minutes, &gap_minutes)
@@ -481,10 +527,14 @@ flagged as (
     from ended e
 ),
 numbered as (
-  select f.*,
-         sum(new_run) over (partition by backup_type order by sample_dt
-                            rows unbounded preceding)                 run_no
-    from flagged f
+  -- Run number per sample second, then back to the individual samples.
+  select p.*, r.run_no
+    from phased p
+    join (select backup_type, sample_dt,
+                 sum(new_run) over (partition by backup_type order by sample_dt
+                                    rows unbounded preceding)         run_no
+            from flagged) r
+      on r.backup_type = p.backup_type and r.sample_dt = p.sample_dt
 ),
 numbered2 as (
   select n.*,
